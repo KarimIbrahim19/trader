@@ -1,0 +1,15 @@
+# ── Core engine ─────────────────────────────────────────────────────
+nautilus_trader>=1.228.0
+
+# ── Config & environment ────────────────────────────────────────────
+pyyaml>=6.0.0
+python-dotenv>=1.0.0
+
+# ── Redis (required by NautilusTrader live TradingNode) ─────────────
+redis>=5.0.0
+
+# ── Telegram notifications (Stage 4) ────────────────────────────────
+python-telegram-bot>=20.0
+
+# ── Utilities ───────────────────────────────────────────────────────
+pandas>=2.0.0       # already installed alongside nautilus_trader
