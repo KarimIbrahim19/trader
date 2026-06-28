@@ -20,6 +20,7 @@ Usage:
 import logging
 import logging.handlers
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 
 from core.config import LoggingSettings
@@ -42,29 +43,36 @@ _LEVEL_COLOURS = {
 }
 
 
-class _ColouredFormatter(logging.Formatter):
-    """Formatter that adds ANSI colour codes based on log level."""
+class _BaseFormatter(logging.Formatter):
+    """Shared base: ISO 8601 timestamps via datetime.strftime (supports %f)."""
 
-    FMT = "%(asctime)s  %(levelname)-8s  %(name)-30s  %(message)s"
-    DATEFMT = "%Y-%m-%d %H:%M:%S"
+    FMT     = "%(asctime)s [%(levelname)s] %(name)s: %(message)s"
+    DATEFMT = "%Y-%m-%dT%H:%M:%S.%f000Z"
+
+    def __init__(self) -> None:
+        super().__init__(fmt=self.FMT, datefmt=self.DATEFMT)
+
+    def formatTime(self, record: logging.LogRecord, datefmt: str | None = None) -> str:
+        dt = datetime.fromtimestamp(record.created, tz=timezone.utc)
+        if datefmt:
+            return dt.strftime(datefmt)
+        return dt.isoformat()
+
+
+class _ColouredFormatter(_BaseFormatter):
+    """Adds ANSI colour codes based on log level."""
 
     def format(self, record: logging.LogRecord) -> str:
         colour = _LEVEL_COLOURS.get(record.levelname, _RESET)
+        original = record.levelname
         record.levelname = f"{colour}{record.levelname}{_RESET}"
-        return super().format(record)
+        result = super().format(record)
+        record.levelname = original
+        return result
 
-    def __init__(self) -> None:
-        super().__init__(fmt=self.FMT, datefmt=self.DATEFMT)
 
-
-class _PlainFormatter(logging.Formatter):
+class _PlainFormatter(_BaseFormatter):
     """Plain formatter for the log file (no colour codes)."""
-
-    FMT    = "%(asctime)s  %(levelname)-8s  %(name)-30s  %(message)s"
-    DATEFMT = "%Y-%m-%d %H:%M:%S"
-
-    def __init__(self) -> None:
-        super().__init__(fmt=self.FMT, datefmt=self.DATEFMT)
 
 
 def setup_logging(cfg: LoggingSettings, project_root: Path | None = None) -> None:

@@ -4,78 +4,113 @@
 # ══════════════════════════════════════════════════════════════════════
 
 # ── Trading mode ──────────────────────────────────────────────────────
-# dry_run : live data, signals logged + Telegram only, NO orders placed
-# paper   : live data, simulated fills (Binance testnet or internal sim)
+# dry_run : live data, signals logged only, NO orders placed
+# paper   : live data, simulated fills (Binance testnet)
 # live    : real orders on real Binance Futures account
 mode: dry_run
 
+# ── Instance identity ────────────────────────────────────────────────
+# Must be unique per running instance to prevent Redis key collisions.
+# Change this when running a second copy (e.g. from ~/live_trader/).
+trader_id: CLTRADER-001
+
 # ── Instrument ────────────────────────────────────────────────────────
 instrument:
-  symbol: BTCUSDT            # raw Binance symbol
-  nt_id: BTCUSDT-PERP.BINANCE  # NautilusTrader instrument ID
-  venue: BINANCE
-  account_type: USDT_FUTURES   # Binance account type for this symbol
+  symbol:       BTCUSDT
+  nt_id:        BTCUSDT-PERP.BINANCE
+  venue:        BINANCE
+  account_type: USDT_FUTURES
 
-# ── Timeframes ────────────────────────────────────────────────────────
-# primary  : bar type used for signal generation
-# htf      : higher timeframe used for bias filter
-# Additional timeframes can be added here in Stage 7
-timeframes:
-  primary: 15m
-  htf: 1h
+# ── Strategies ────────────────────────────────────────────────────────
+# Each strategy is fully independent:
+#   • its own bar types, signal params, and risk limits
+#   • enabled: false disables all new entries without touching the code
+#   • multiple strategies can run simultaneously (each has its own ledger)
+#   • add a new strategy block here and add its class in main.py
 
-# ── Strategy ──────────────────────────────────────────────────────────
-strategy:
-  name: ms_htf               # which strategy class to load
+strategies:
 
-  # Market structure parameters
-  swing_len: 10              # pivot lookback bars each side
-  atr_dist: 0.5              # min ATR distance between opposite pivots
-  atr_len: 14                # ATR period inside the MS engine
+  ms:
+    enabled: true
+    strategy_id: MS-001
+    primary_bar: 1m
+    htf_bar:     5m
 
-  # HTF bias
-  htf_filter: true           # require 1H HMA agreement before entry
-  htf_period: 21             # HMA period on the HTF
+    # Market Structure signal params
+    swing_len: 10
+    atr_dist:  0.5
+    atr_len:   14
 
-# ── Risk management ───────────────────────────────────────────────────
-risk:
-  trade_size: 0.001          # BTC per trade (start very small)
+    # HTF bias filter
+    htf_filter: false
+    htf_period: 21
 
-  sl_atr: 1.5                # stop loss distance × ATR
-  tp1_atr: 2.0               # TP1 distance × ATR  (closes 50%)
-  tp2_atr: 3.5               # TP2 distance × ATR  (closes remainder)
+    # Risk — independent from every other strategy
+    trade_size:            0.001   # BTC per trade — start very small
+    sl_atr:                1.5     # stop loss      = sl_atr  × ATR
+    tp1_atr:               2.0     # TP1 (50% close) = tp1_atr × ATR
+    tp2_atr:               3.5     # TP2 (remainder) = tp2_atr × ATR
+    trailing_tp2:          false   # false = fixed TP2 level
+    trail_atr_mult:        3.5     # trailing callback (only if trailing_tp2: true)
+    breakeven_sl:          true    # move SL to entry once TP1 fires
+    enable_exit_signal:    true    # close on opposite momentum signal
+    enable_sl:             true    # enable stop loss
+    max_open_trades:       5       # hard cap on simultaneous open trades
+    daily_loss_limit_usdt: 50.0    # no new entries if daily PnL < -this
 
-  trailing_tp2: false        # trailing TP2 (false = fixed level)
-  trail_atr_mult: 3.5        # trailing callback distance × ATR (if above is true)
-  breakeven_sl: true         # move SL to entry once TP1 fires
-  enable_exit_signal: true   # close on opposite momentum signal
+  fvg:
+    enabled: true          # ← flip to true once backtesting validates params
+    strategy_id: FVG-001
+    primary_bar: 1m        # ← update to winning timeframe from backtesting
+    htf_bar:     1h
 
-  max_open_trades: 5         # hard cap on simultaneously open trades
-  daily_loss_limit_usdt: 50.0  # no new entries if daily PnL drops below this
+    # FVG signal params
+    fvg_atr_len:      14
+    fvg_atr_mult:     0.25
+    fvg_max_zones:    10
+    fvg_sig_lookback: 3
+    fvg_ifvg_enable:  true
+    fvg_sig_cooldown: -1    # -1 = single signal per zone ever
+    fvg_max_age:      -1    # -1 = zones never expire
+
+    # HTF bias filter
+    htf_filter: false       # ← update based on backtesting results
+    htf_period: 21
+
+    # Risk — completely independent from MS
+    trade_size:            0.001
+    sl_atr:                1.5
+    tp1_atr:               2.0
+    tp2_atr:               3.5
+    trailing_tp2:          false
+    trail_atr_mult:        3.5
+    breakeven_sl:          false
+    enable_exit_signal:    true
+    enable_sl:             true
+    max_open_trades:       3
+    daily_loss_limit_usdt: 30.0
 
 # ── Redis ─────────────────────────────────────────────────────────────
-# Required by NautilusTrader's live TradingNode for internal cache state
 redis:
-  host: localhost
-  port: 6379
+  host:         localhost
+  port:         6379
   timeout_secs: 20
 
 # ── Logging ───────────────────────────────────────────────────────────
 logging:
-  level: INFO                # console log level: DEBUG | INFO | WARNING | ERROR
-  level_file: DEBUG          # file log level (more verbose than console)
-  log_dir: logs              # relative to project root
-  log_file_name: btc_trader.log
-  rotate_mb: 50              # rotate log file after this many MB
-  keep_backups: 5            # how many rotated files to keep
+  level:         INFO
+  level_file:    DEBUG
+  log_dir:       logs
+  log_file_name: CL_trader.log
+  rotate_mb:     5
+  keep_backups:  10
 
 # ── Telegram ──────────────────────────────────────────────────────────
-# Bot token and chat_id go in config/.env
 telegram:
-  enabled: false             # set to true once bot is configured
-  notify_signals: true       # send a message when a signal is detected
-  notify_entries: true       # send a message when a trade opens
-  notify_exits: true         # send a message when a trade closes (SL/TP/etc)
-  notify_daily_summary: true
-  daily_summary_utc: "00:00" # time to send the daily summary (UTC)
-  heartbeat_interval_mins: 60  # send a silent ✅ every N minutes (0 = disable)
+  enabled:                 true
+  notify_signals:          true
+  notify_entries:          true
+  notify_exits:            true
+  notify_daily_summary:    true
+  daily_summary_utc:       "00:00"
+  heartbeat_interval_mins: 60

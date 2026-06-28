@@ -91,7 +91,7 @@ def build_node(settings: Settings) -> TradingNode:
 
     # ── Node config ────────────────────────────────────────────────────
     node_cfg = TradingNodeConfig(
-        trader_id   = TraderId("BTCTRADER-001"),
+        trader_id   = TraderId(settings.trader_id),
         cache       = cache_cfg,
         logging     = nt_logging,
         risk_engine = risk_cfg,
@@ -108,8 +108,9 @@ def build_node(settings: Settings) -> TradingNode:
     # Stage 5: node.add_exec_client_factory("BINANCE", BinanceLiveExecClientFactory)
 
     logger.info(
-        "TradingNode built  trader_id=BTCTRADER-001  "
+        "TradingNode built  trader_id=%s  "
         "data_client=Binance(USDT_FUTURES)  redis=%s:%d",
+        settings.trader_id,
         settings.redis.host,
         settings.redis.port,
     )
