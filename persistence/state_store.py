@@ -98,7 +98,7 @@ class StateStore:
         return self._path
 
     # ── Save ──────────────────────────────────────────────────────────────
-    def save(self, ledger: TradeLedger) -> None:
+    def save(self, ledger: TradeLedger, order_to_trade: dict[str, list[int]] = None) -> None:
         """
         Persist the current open trades and next_id to disk.
         Called from the strategy's on_stop().
@@ -119,6 +119,7 @@ class StateStore:
             "saved_at":    datetime.now(timezone.utc).isoformat(),
             "next_id":     ledger.next_id,
             "open_trades": [_trade_to_dict(t) for t in ledger.open_trades],
+            "order_to_trade": order_to_trade or {},
         }
 
         try:
@@ -132,11 +133,11 @@ class StateStore:
             log.error("StateStore: failed to save state: %s", e)
 
     # ── Load ──────────────────────────────────────────────────────────────
-    def load(self) -> Optional[tuple[list[OpenTrade], int]]:
+    def load(self) -> Optional[tuple[list[OpenTrade], int, dict[str, list[int]]]]:
         """
         Load persisted state from disk.
 
-        Returns (open_trades, next_id) if a valid state file is found,
+        Returns (open_trades, next_id, order_to_trade) if a valid state file is found,
         or None if there is no file (fresh start).
         Logs a WARNING for each restored trade as a manual check reminder.
         """
@@ -150,6 +151,7 @@ class StateStore:
 
             open_trades = [_trade_from_dict(d) for d in payload["open_trades"]]
             next_id     = int(payload["next_id"])
+            order_to_trade = payload.get("order_to_trade", {})
             saved_at    = payload.get("saved_at", "unknown")
 
             log.warning(
@@ -164,7 +166,7 @@ class StateStore:
                     t.sl, t.tp1_hit, t.realized_pnl,
                 )
 
-            return open_trades, next_id
+            return open_trades, next_id, order_to_trade
 
         except (json.JSONDecodeError, KeyError, ValueError) as e:
             log.error(

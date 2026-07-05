@@ -1,7 +1,7 @@
 """
 scripts/check_infra.py
 ────────────────────────────────────────────────────────────────────────
-Infrastructure validation script — updated for Stage 3.
+Infrastructure validation script.
 
 Checks every infrastructure component before live trading.
 Run after initial setup and after any environment change.
@@ -214,7 +214,7 @@ def check_telegram(settings) -> bool:
         msg_url = f"https://api.telegram.org/bot{token}/sendMessage"
         payload = _json.dumps({
             "chat_id": chat_id,
-            "text": "✅ BTC Trader Stage 3 — infrastructure check passed.",
+            "text": "✅ BTC Trader — infrastructure check passed.",
         }).encode()
         req2 = urllib.request.Request(msg_url, data=payload,
                                        headers={"Content-Type": "application/json"})
@@ -256,9 +256,9 @@ def check_signal_modules() -> bool:
     return all_ok
 
 
-# ── 8. Stage 3 modules ───────────────────────────────────────────────────
-def check_stage3_modules() -> bool:
-    _section("8. Stage 3 modules")
+# ── 8. Strategy modules ───────────────────────────────────────────────────
+def check_strategy_modules() -> bool:
+    _section("8. Strategy modules")
     modules = [
         ("risk.trade_ledger",         "TradeLedger"),
         ("risk.position_manager",     "PositionManager"),
@@ -329,7 +329,7 @@ def main() -> None:
     args = parser.parse_args()
 
     print("\n" + "═" * 60)
-    print("  BTC Trader — Infrastructure Check (Stage 3)")
+    print("  BTC Trader — Infrastructure Check")
     print("═" * 60)
 
     config_path = Path(args.config)
@@ -345,7 +345,7 @@ def main() -> None:
     api_ok      = check_binance_api_keys(settings)
     tg_ok       = check_telegram(settings)
     modules_ok  = check_signal_modules()
-    stage3_ok   = check_stage3_modules()
+    strategy_ok = check_strategy_modules()
     nt_ok       = check_nautilus()
     state_ok    = check_state_files()
 
@@ -357,7 +357,7 @@ def main() -> None:
         "Binance API":      api_ok,
         "Telegram":         tg_ok,
         "Signal modules":   modules_ok,
-        "Stage 3 modules":  stage3_ok,
+        "Strategy modules":  strategy_ok,
         "NautilusTrader":   nt_ok,
         "State files":      state_ok,
     }
@@ -375,7 +375,7 @@ def main() -> None:
 
     print()
     if all_passed:
-        print("  \033[32mAll checks passed — ready to run Stage 3.\033[0m")
+        print("  \033[32mAll checks passed — ready to run.\033[0m")
         enabled = settings.enabled_strategies
         if enabled:
             print(f"  Active strategies: {', '.join(enabled.keys())}")

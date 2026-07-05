@@ -7,11 +7,10 @@
 # dry_run : live data, signals logged only, NO orders placed
 # paper   : live data, simulated fills (Binance testnet)
 # live    : real orders on real Binance Futures account
-mode: dry_run
+mode: paper
 
 # ── Instance identity ────────────────────────────────────────────────
 # Must be unique per running instance to prevent Redis key collisions.
-# Change this when running a second copy (e.g. from ~/live_trader/).
 trader_id: CLTRADER-001
 
 # ── Instrument ────────────────────────────────────────────────────────
@@ -21,96 +20,128 @@ instrument:
   venue:        BINANCE
   account_type: USDT_FUTURES
 
-# ── Strategies ────────────────────────────────────────────────────────
-# Each strategy is fully independent:
-#   • its own bar types, signal params, and risk limits
-#   • enabled: false disables all new entries without touching the code
-#   • multiple strategies can run simultaneously (each has its own ledger)
-#   • add a new strategy block here and add its class in main.py
+# ── Futures leverage & margin type ───────────────────────────────────
+# leverage:    Required. Applied via Binance API on every startup.
+#              Safe to change anytime, even with open positions.
+# margin_type: Optional. Only set this field when the BTCUSDT position
+#              is ZERO. Binance rejects changes (-4046) if a position
+#              exists. To change with open positions:
+#                1. Remove this field from YAML, restart (no API call).
+#                2. Flatten all BTCUSDT positions.
+#                3. Re-add with new value, restart.
+#              Valid values: CROSSED | ISOLATED
+futures:
+  leverage:    10
+  margin_type: CROSSED
 
+# ── Strategies ────────────────────────────────────────────────────────
 strategies:
 
   ms:
-    enabled: true
-    strategy_id: MS-001
-    primary_bar: 1m
-    htf_bar:     5m
-
-    # Market Structure signal params
-    swing_len: 10
-    atr_dist:  0.5
-    atr_len:   14
-
-    # HTF bias filter
-    htf_filter: false
-    htf_period: 21
-
-    # Risk — independent from every other strategy
-    trade_size:            0.001   # BTC per trade — start very small
-    sl_atr:                1.5     # stop loss      = sl_atr  × ATR
-    tp1_atr:               2.0     # TP1 (50% close) = tp1_atr × ATR
-    tp2_atr:               3.5     # TP2 (remainder) = tp2_atr × ATR
-    trailing_tp2:          false   # false = fixed TP2 level
-    trail_atr_mult:        3.5     # trailing callback (only if trailing_tp2: true)
-    breakeven_sl:          true    # move SL to entry once TP1 fires
-    enable_exit_signal:    true    # close on opposite momentum signal
-    enable_sl:             true    # enable stop loss
-    max_open_trades:       5       # hard cap on simultaneous open trades
-    daily_loss_limit_usdt: 50.0    # no new entries if daily PnL < -this
+    enabled:                  true
+    strategy_id:              MS-001
+    primary_bar:              1m
+    swing_len:                10
+    atr_dist:                 0.5
+    atr_len:                  14
+    htf_filter:               false
+    htf_bar:                  1h
+    htf_period:               21
+    trade_size:               0.01     # BTC per trade
+    sl_atr:                   1.5       # stop loss      = sl_atr  × ATR
+    tp1_atr:                  2.0       # TP1 (50% close) = tp1_atr × ATR
+    tp2_atr:                  3.5       # TP2 (remainder) = tp2_atr × ATR
+    trailing_tp2:             false     # false = fixed TP2 level
+    trail_atr_mult:           3.5       # trailing callback (only if trailing_tp2: true)
+    breakeven_sl:             true      # move SL to entry once TP1 fires
+    enable_exit_signal:       true      # close on opposite momentum signal
+    enable_sl:                true      # enable stop loss
+    max_open_trades:          5         # hard cap on simultaneous open trades
+    daily_loss_limit_usdt:    50.0      # no new entries if daily PnL < -this
+    min_free_margin_usdt:     50.0      # min free USDT before opening. 0.0 = disabled. dry_run ignores this.
+    warmup_bars:              200
+    htf_warmup_bars:          50
 
   fvg:
-    enabled: true          # ← flip to true once backtesting validates params
-    strategy_id: FVG-001
-    primary_bar: 1m        # ← update to winning timeframe from backtesting
-    htf_bar:     1h
+    enabled:                  true
+    strategy_id:              FVG-001
+    primary_bar:              1m
+    fvg_atr_len:              14
+    fvg_atr_mult:             0.25
+    fvg_max_zones:            10
+    fvg_sig_lookback:         3
+    fvg_ifvg_enable:          true
+    fvg_sig_cooldown:         -1        # -1 = single signal per zone ever
+    fvg_max_age:              -1        # -1 = zones never expire
+    htf_filter:               false
+    htf_bar:                  1h
+    htf_period:               21
+    trade_size:               0.01
+    sl_atr:                   1.5
+    tp1_atr:                  2.0
+    tp2_atr:                  3.5
+    trailing_tp2:             false
+    trail_atr_mult:           3.5
+    breakeven_sl:             false
+    enable_exit_signal:       true
+    enable_sl:                true
+    max_open_trades:          3
+    daily_loss_limit_usdt:    30.0
+    min_free_margin_usdt:     30.0
+    warmup_bars:              250
+    htf_warmup_bars:          50
 
-    # FVG signal params
-    fvg_atr_len:      14
-    fvg_atr_mult:     0.25
-    fvg_max_zones:    10
-    fvg_sig_lookback: 3
-    fvg_ifvg_enable:  true
-    fvg_sig_cooldown: -1    # -1 = single signal per zone ever
-    fvg_max_age:      -1    # -1 = zones never expire
+# ── Exchange filters (fallback if API fetch fails) ────────────────────
+# Per-symbol overrides for MARKET_LOT_SIZE and MIN_NOTIONAL from
+# GET /fapi/v1/exchangeInfo. The API is always tried first.
+exchange_filters:
+  BTCUSDT:
+    market_lot_size:
+      min_qty: 0.001
+      step_size: 0.001
+    min_notional:
+      notional: 50
 
-    # HTF bias filter
-    htf_filter: false       # ← update based on backtesting results
-    htf_period: 21
-
-    # Risk — completely independent from MS
-    trade_size:            0.001
-    sl_atr:                1.5
-    tp1_atr:               2.0
-    tp2_atr:               3.5
-    trailing_tp2:          false
-    trail_atr_mult:        3.5
-    breakeven_sl:          false
-    enable_exit_signal:    true
-    enable_sl:             true
-    max_open_trades:       3
-    daily_loss_limit_usdt: 30.0
+# ── Reconciliation ────────────────────────────────────────────────────
+# Controls the LedgerReconciler (Stage 6). Compares aggregate ledger
+# exposure across all strategies to the single Binance NETTING position.
+#
+# Case A (exchange < expected): WARNING + Telegram only. No auto-heal.
+# Case B (exchange > expected): HALT all new entries + CRITICAL alert.
+#                               Restart required to resume trading.
+#
+# Ignored completely in dry_run mode (no portfolio available).
+# Set enabled: false to disable without removing the block.
+reconciliation:
+  enabled:       true
+  # Seconds after any ledger mutation before the next check runs.
+  # Prevents false positives during in-flight order confirmation.
+  grace_secs:    15.0
+  # Differences smaller than this (BTC) are treated as rounding/fees.
+  # 0.0001 = one-tenth of the 0.001 BTC minimum order size.
+  tolerance_btc: 0.0001
 
 # ── Redis ─────────────────────────────────────────────────────────────
 redis:
-  host:         localhost
-  port:         6379
-  timeout_secs: 20
+  host:            localhost
+  port:            6379
+  timeout_secs:    20
 
 # ── Logging ───────────────────────────────────────────────────────────
 logging:
-  level:         INFO
-  level_file:    DEBUG
-  log_dir:       logs
-  log_file_name: CL_trader.log
-  rotate_mb:     5
-  keep_backups:  10
+  level:           INFO
+  level_file:      DEBUG
+  log_dir:         logs
+  log_file_name:   btc_trader.log
+  rotate_mb:       50
+  keep_backups:    5
 
 # ── Telegram ──────────────────────────────────────────────────────────
 telegram:
-  enabled:                 true
-  notify_signals:          true
-  notify_entries:          true
-  notify_exits:            true
-  notify_daily_summary:    true
-  daily_summary_utc:       "00:00"
-  heartbeat_interval_mins: 60
+  enabled:                    true
+  notify_signals:             true
+  notify_entries:             true
+  notify_exits:               true
+  notify_daily_summary:       true
+  daily_summary_utc:          "00:00"
+  heartbeat_interval_mins:    60

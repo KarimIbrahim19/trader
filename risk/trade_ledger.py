@@ -49,9 +49,13 @@ class OpenTrade:
     realized_pnl: float          = 0.0    # accumulates across partial closes
     exit_ts:      Optional[int]  = None
     exit_reason:  str            = ""
+    # PnL delta from last close order — used for rejection revert
+    _pending_close_pnl: float = 0.0
     # Trailing TP2 state — both None unless trailing_tp2 is enabled
     best_price:     Optional[float] = None   # ratchets favorably only
     trail_distance: Optional[float] = None   # frozen ATR × mult, set at TP1 fire
+    # Saved right before TP1 state change so rejection revert can restore SL
+    _pre_tp1_sl: Optional[float] = None
 
 
 # ── Utility functions ─────────────────────────────────────────────────────

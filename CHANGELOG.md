@@ -1,9 +1,91 @@
 # Changelog
 
-## 2026-06-26 — Minor fixes from manager review
+## 2026-07-03 — Close-order rejection revert + flip exit reason labeling
+
+### Added
+- `OpenTrade._pending_close_pnl` field — stores the PnL delta from the last
+  close submission, used for rejection revert. (`risk/trade_ledger.py`)
+- `docs/close_rejection_handling.md` — documents the current revert-based
+  approach (Option A) and the deferred-to-fill alternative (Option B) for
+  future reference.
 
 ### Fixed
+- **Close-order rejection ledger corruption**: `_close_trade()` now registers
+  close orders in the strategy's `_order_to_trade` map (same pattern as entries).
+  `on_order_rejected()` detects close rejections by finding the trade in
+  `closed_trades`, then reverts: removes from `closed_trades`, clears `exit_ts`/
+  `exit_reason`, subtracts `_pending_close_pnl` from `realized_pnl`, and re-adds
+  to `open_trades`. The next bar's management loop retries the close.
+  (`risk/position_manager.py`, `strategies/base_smc_strategy.py`)
+- **Flip exit reason**: `_execute_netted_flip()` now checks each opposing trade's
+  SL/TP levels against the bar's `high/low` to assign the real exit reason
+  (`"SL"`, `"BE"`, `"TP1"`, `"TP2"`, or `"exit-signal"`) instead of always
+  hardcoding `"exit-signal"`. The FLIP CLOSE log line now includes `reason=`
+  for at-a-glance debugging. (`risk/position_manager.py`)
+- **Close revert Telegram notification**: new `on_close_reverted()` notifier
+  sends `🔄 CLOSE REVERTED — will retry next bar` when a close rejection is
+  reverted. (`actors/telegram_actor.py`, `strategies/base_smc_strategy.py`)
 
-- `core/config.py` — Removed unused `field` from dataclass import (`field,` → `fields` only). Lint noise, no functional change.
+## 2026-07-03 — Netted flip: purge dead trades from open_trades (fixes Case B / -2022 cascade)
 
-- `core/config.py` — Added `build_config()` to `StrategySettingsBase` with a `NotImplementedError`. Previously calling `build_config()` on a subclass that forgot to implement it would raise a cryptic `AttributeError` at runtime. Now it raises a clear error pointing to `MsSettings` or `FvgSettings` as the pattern.
+### Fixed
+- `_execute_netted_flip()` in `risk/position_manager.py` now purges closed opposing trades from
+  `open_trades` after setting `exit_ts`, preventing the dead trade from offsetting the live flip
+  trade in the reconciler's position calculation.
+- `_manage_open_trades()` in `risk/position_manager.py` now guards against trades with `exit_ts`
+  set, preventing any future code path from re-adding an already-closed trade to `still_open`.
+
+### Bug chain
+1. Flip closed opposing SHORT via `record_close(final=True)` but never removed it from `open_trades`.
+2. `_manage_open_trades` re-added the dead SHORT to `still_open` (no `exit_ts` check).
+3. Reconciler saw FVG ledger with `SHORT -0.001 + LONG +0.001 = 0.000` → **Case B halt**.
+4. After real LONG was closed by SL, only the dead SHORT remained → FVG=−0.001 → halt persisted.
+5. `reduce_only=True` close orders for trades already gone on exchange → **`-2022` rejection**.
+
+## 2026-07-02 — Futures leverage/margin type config (fixes startup crash after Redis flush)
+
+### Added
+
+- `core/config.py` — New `FuturesSettings` dataclass with `leverage: int` (required) and `margin_type: str | None` (optional). Validation checks leverage >= 1 and margin_type ∈ {CROSSED, ISOLATED}.
+
+- `config/settings.yaml` — New `futures:` block with documented constraints: leverage is safe to change anytime; margin_type requires zero position (Binance error `-4046` if a position exists). When `margin_type` is omitted, no API call is made.
+
+### Changed
+
+- `core/node_builder.py` — Added imports `BinanceSymbol`, `BinanceFuturesMarginType`. `BinanceExecClientConfig` now receives `futures_leverages` (always) and `futures_margin_types` (only when set in YAML). This tells NT to call `POST /fapi/v1/leverage` directly instead of fetching stale testnet position risk data.
+
+- `core/node_builder.py` — Added monkey-patch on `BinanceFuturesExecutionClient._update_account_state` that catches `ValueError` from the per-symbol leverage sync loop (Stage B). NT calls `GET /fapi/v1/symbolConfig` with no filter, then iterates all returned symbols calling `account.set_leverage()`. If any symbol has `leverage=0` (testnet quirk), the dead `except KeyError` handler fails to catch the `ValueError`, crashing `_connect()`. Patch wraps the method and logs a warning instead. Fixed upstream in NT v1.229.0 PR #4289; remove after upgrade.
+
+### Documentation
+
+- `docs/binance_leverage_init_bug.md` — Detailed document explaining the leverage initialization bug, root cause (dead `except KeyError` handler), crash sequence, upstream fix reference, monkey-patch workaround, and removal instructions.
+
+## 2026-07-02 — Option C: netted flip orders (fixes `-2022` ReduceOnly race)
+
+### Added
+
+- `risk/position_manager.py` — `_is_flip_scenario()` detects when the bar signal opposes all open trades (e.g. SHORT signal while LONG trades exist). Returns True even with mixed-direction trades (edge case from restart recovery).
+
+- `risk/position_manager.py` — `_execute_netted_flip()` submits a single atomic market order instead of N closes + 1 entry. Sums opposing-side remaining qty (accounting for partial TP1 closes), checks entry gates with adjusted count (`open_count - opposing + 1`), submits one order with `reduce_only=False`. Closes oppose trades in the ledger with leg-level PnL, opens new trade if gates pass. Logs distinct `FLIP` lines and fires `on_netted_flip` notification.
+
+- `risk/position_manager.py` — Modified `on_bar()` routes to `_execute_netted_flip()` when `_is_flip_scenario()` is true, then still runs `_manage_open_trades()` for any remaining same-direction trades. Non-flip bars unchanged.
+
+- `actors/telegram_actor.py` — `on_netted_flip()` handler sends a summary message (net side/qty, sum opposing, count closed, whether new entry was included) for operational verification of net calculations.
+
+## 2026-06-30 — Exit-signal `reduce_only` fix + warmup timeout safeguard
+
+### Added
+
+- `strategies/base_smc_strategy.py` — Added `_log_warmup_health()` hook, called at end of `_on_warmup_done()`. Default is no-op; subclasses override to log post-warmup indicator state.
+
+- `strategies/ms_strategy.py` — `_log_warmup_health()` logs ATR value and momentum signal states after warmup.
+
+- `strategies/fvg_strategy.py` — `_log_warmup_health()` logs ATR value, total zone count (bull/bear split), and near-zone proximity flags after warmup.
+
+- `NOTES.md` — Added close order rejection retry gap under Ledger Architecture. Documents that Stage 6 should add automatic retry with exponential backoff for rejected close orders in live trading.
+
+- `docs/position_mode_netting_vs_hedge.md` — Reference doc explaining NETTING vs HEDGE position modes on Binance Futures, how our system works on NETTING, what switching to HEDGE would require, and why NETTING is preferred.
+
+### Changed
+
+- `risk/position_manager.py` — Exit-signal close orders now pass `reduce_only=False`. Previously all close types hardcoded `reduce_only=True`, causing `-2022 ReduceOnly Order is rejected` when an exit-signal batch (closing old trades + opening a new opposite-direction trade) had its new entry fill first, shifting net position to zero before all reduce-only exit orders landed. TP/SL/Trailing closes keep `reduce_only=True`.
