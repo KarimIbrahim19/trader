@@ -1,5 +1,69 @@
 # Changelog
 
+## 2026-07-06 — Multi-exchange / multi-symbol refactor
+
+### Added
+- `venues:` and `symbols:` YAML blocks (`config/settings.yaml`) replacing the
+  single global `instrument:`/`futures:` blocks. `venues:` holds connection-
+  level settings per exchange; `symbols:` (keyed `"venue:SYMBOL"`) holds
+  exchange-account settings (leverage, margin type, filter fallbacks) shared
+  by every strategy trading that symbol on that venue.
+- Every strategy block now declares its own `venue:` and `symbol:`. An
+  optional `type:` field decouples a strategy's instance name from its
+  REGISTRY class, so the same strategy type can run multiple instances on
+  different symbols (e.g. `ms` on BTCUSDT + `ms_eth` on ETHUSDT).
+- `core/exchanges/` adapter package (`base.py`, `binance.py`, `__init__.py`
+  registry) — all Binance-specific NT wiring (client configs, testnet URLs,
+  the v1.228 leverage-init monkey-patch, exchange-filter/API-key HTTP calls)
+  moved out of `core/node_builder.py` and `scripts/check_infra.py` into one
+  adapter. Adding a new exchange now means one new adapter file + one
+  registry line — no changes elsewhere.
+- `VenueCredentials` (`core/config.py`) — resolves each venue's API
+  key/secret from `{VENUE}_API_KEY`/`{VENUE}_TESTNET_API_KEY`-style env
+  vars by naming convention, so a new venue's credentials need no code
+  changes, only new `.env` entries.
+- `docs/multi_exchange_architecture.md` — design rationale and migration
+  notes for this refactor.
+
+### Changed
+- `core/node_builder.py`: now loops over configured venues and builds one
+  data/exec client pair per venue via its adapter, instead of one hardcoded
+  Binance pair.
+- `main.py`: resolves each strategy's `instrument_id` and exchange-filter
+  fallback from its own `(venue, symbol)` pair instead of one shared global.
+- `strategies/base_smc_strategy.py`: `BaseSmcConfig` gains a `venue` field;
+  the balance-check closure resolves the NT `Venue` and quote currency from
+  the strategy's own config/instrument instead of hardcoded
+  `Venue("BINANCE")` / `USDT`; exchange-filter fetch delegates to the
+  venue's adapter instead of a hardcoded Binance HTTP call.
+- **`risk/reconciler.py` (breaking internal API change)**: `LedgerReconciler`
+  now groups all state — registered ledgers, the portfolio-position
+  callable, the mutation grace period, and the halt flag — by
+  `(venue, instrument_id)` instead of one shared global. Every method
+  (`register_strategy`, `set_portfolio_fn`, `record_mutation`, `check`,
+  `is_halted`) takes `(venue, instrument_id, ...)`. A Case B halt on one
+  symbol/venue no longer affects any other. This was necessary groundwork
+  for both this refactor and the upcoming reconciler self-healing redesign
+  (`docs/stage6_reply.md`), which also needs per-instrument grouping.
+- `actors/telegram_actor.py`: `on_reconcile_warning`/`on_reconcile_halt` take
+  an additional `group` label identifying which `(venue, instrument)` group
+  triggered the alert; unit labels changed from hardcoded "BTC" to plain
+  numbers since positions are no longer necessarily BTC-denominated.
+- `scripts/check_infra.py`: connectivity and API-key checks now loop over
+  every configured venue via its adapter instead of hardcoding Binance.
+
+### Verified
+- Config loads, validates, and rejects bad `venue`/`symbol` references with
+  clear errors.
+- `build_node()` constructs a real `TradingNode` (against installed
+  `nautilus_trader==1.230.0`) with correctly keyed data/exec clients.
+- Reconciler groups are independent: a Case B halt on one `(venue,
+  instrument)` group does not affect another, verified with a standalone
+  BTCUSDT + ETHUSDT test.
+- Full pipeline proof: three strategy instances (`ms`→BTCUSDT, `fvg`→BTCUSDT,
+  `ms_eth`→ETHUSDT, all on `binance`) build correctly against one shared
+  BINANCE data/exec client with per-symbol leverage.
+
 ## 2026-07-03 — Close-order rejection revert + flip exit reason labeling
 
 ### Added

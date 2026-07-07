@@ -18,8 +18,9 @@ Stage 6 additions:
       3. Suppress long_signal/short_signal if reconciler.is_halted (Case B).
 
   • _make_position_fn(): returns a closure that reads the signed net
-    BTC position from NT's portfolio. Positive = net long, negative =
-    net short, 0 = flat. Returns None when portfolio isn't ready yet.
+    position (in this strategy's own instrument) from NT's portfolio.
+    Positive = net long, negative = net short, 0 = flat. Returns None
+    when portfolio isn't ready yet.
 
   • BaseSmcConfig: no new fields — reconciler is injected, not configured.
 
@@ -29,20 +30,18 @@ all unchanged.
 
 from __future__ import annotations
 
-import json
-import urllib.request
 from datetime import timedelta
 from decimal import Decimal
 from typing import Optional
 
 from nautilus_trader.config import StrategyConfig
 from nautilus_trader.core.data import Data
-from nautilus_trader.model.currencies import USDT
 from nautilus_trader.model.data import Bar, BarAggregation, BarType
 from nautilus_trader.model.enums import OrderSide, TimeInForce
 from nautilus_trader.model.identifiers import InstrumentId, Venue
 from nautilus_trader.trading.strategy import Strategy
 
+from core.exchanges import get_adapter
 from core.htf_bias import HTFBias
 from persistence.state_store import StateStore
 from risk.position_manager import PositionManager, PositionManagerConfig
@@ -60,6 +59,7 @@ _BAR_STEP_SECONDS = {
 # ── Base config ───────────────────────────────────────────────────────────
 class BaseSmcConfig(StrategyConfig, frozen=True):
     instrument_id:         InstrumentId
+    venue:                 str    # e.g. "binance" -- key into core.exchanges.get_adapter()
     bar_type:              BarType
     bar_type_htf:          BarType
     mode:                  str
@@ -98,6 +98,7 @@ class BaseSmcStrategy(Strategy):
         self._bar_count:     int = 0
         self.pm:             PositionManager | None = None
         self.instrument      = None
+        self._symbol:        str = ""   # set properly in on_start() once instrument_id is known
         self._notifier       = None
         self._strategy_name  = ""
         self._reconciler     = None    # Stage 6: shared LedgerReconciler
@@ -155,40 +156,32 @@ class BaseSmcStrategy(Strategy):
     # ── Exchange filter fetch ─────────────────────────────────────────────
     def _fetch_exchange_filters(self) -> tuple[Decimal, float]:
         """
-        Fetch MARKET_LOT_SIZE.minQty and MIN_NOTIONAL.notional from
-        GET /fapi/v1/exchangeInfo for this strategy's instrument.
+        Fetch MARKET_LOT_SIZE.minQty and MIN_NOTIONAL.notional for this
+        strategy's instrument via its venue's adapter (e.g. Binance's
+        GET /fapi/v1/exchangeInfo -- see core/exchanges/binance.py).
 
         Returns (min_qty, min_notional).
-        Falls back to self._exchange_filters_fallback on any error.
+        Falls back to self._exchange_filters_fallback if the adapter
+        can't fetch it (or in dry_run, where nothing is queried).
         """
         symbol = str(self.config.instrument_id).split("-")[0]  # "BTCUSDT"
 
         if self.config.mode != "dry_run":
-            base_url = (
-                "https://testnet.binancefuture.com"
-                if self.config.mode == "paper"
-                else "https://fapi.binance.com"
+            adapter = get_adapter(self.config.venue)
+            fetched = adapter.fetch_exchange_filters(
+                symbol, is_paper=(self.config.mode == "paper"),
             )
-            try:
-                url = f"{base_url}/fapi/v1/exchangeInfo"
-                with urllib.request.urlopen(url, timeout=3) as resp:
-                    data = json.loads(resp.read())
-                sym_info = next(s for s in data["symbols"] if s["symbol"] == symbol)
-                filters = {f["filterType"]: f for f in sym_info["filters"]}
-                mls = filters.get("MARKET_LOT_SIZE", {})
-                mn  = filters.get("MIN_NOTIONAL", {})
-                min_qty      = Decimal(mls.get("minQty", "0.001"))
-                min_notional = float(mn.get("notional", "50"))
+            if fetched is not None:
+                min_qty, min_notional = fetched
                 self.log.info(
-                    f"Exchange filters fetched  symbol={symbol}  "
+                    f"Exchange filters fetched  venue={self.config.venue}  symbol={symbol}  "
                     f"min_qty={min_qty}  min_notional=${min_notional:.2f}"
                 )
                 return min_qty, min_notional
-            except Exception as e:
-                self.log.warning(
-                    f"Failed to fetch exchange filters from {base_url}: {e}  "
-                    f"falling back to config"
-                )
+            self.log.warning(
+                f"Exchange filter fetch failed for {self.config.venue}:{symbol}  "
+                "falling back to config"
+            )
 
         # Fallback
         fb = self._exchange_filters_fallback
@@ -213,6 +206,10 @@ class BaseSmcStrategy(Strategy):
                 "Strategy will not trade until this is fixed."
             )
             return
+        # e.g. "BTCUSDT" -- used only for log/notification labeling, so a
+        # reader can tell which symbol a message is about once more than
+        # one is running.
+        self._symbol = str(cfg.instrument_id).split("-")[0]
         self._init_signal_modules()
 
         # ── Phase 1 warmup ────────────────────────────────────────────
@@ -279,19 +276,27 @@ class BaseSmcStrategy(Strategy):
         # ── Stage 6: register with reconciler ─────────────────────────
         # on_start() is called AFTER NT's ExecMassStatus reconciliation,
         # so the portfolio already reflects the real exchange state.
+        # Grouped by (venue, instrument_id) -- strategies sharing that
+        # pair (e.g. MS + FVG both on binance:BTCUSDT) share one group;
+        # strategies on a different symbol or venue get their own.
         if self._reconciler is not None and cfg.mode != "dry_run":
             self._reconciler.register_strategy(
                 self._strategy_name or "unknown",
                 self.ledger,
+                cfg.venue,
+                cfg.instrument_id,
             )
-            # First strategy to call this wins — all strategies share
-            # the same NT portfolio for the same instrument.
-            self._reconciler.set_portfolio_fn(self._make_position_fn())
+            # First strategy in a group to call this wins — all
+            # strategies in that group share the same NT portfolio
+            # position for that (venue, instrument) pair.
+            self._reconciler.set_portfolio_fn(
+                cfg.venue, cfg.instrument_id, self._make_position_fn()
+            )
 
             # 6D: startup check if restored trades exist
             if saved and len(self.ledger.open_trades) > 0:
                 ts_ns = int(self.clock.utc_now().timestamp() * 1e9)
-                result = self._reconciler.check(ts_ns, self.log)
+                result = self._reconciler.check(cfg.venue, cfg.instrument_id, ts_ns, self.log)
                 if result.checked and result.case not in ("ok", None):
                     self.log.warning(
                         f"Startup reconciliation: Case {result.case}  "
@@ -329,6 +334,7 @@ class BaseSmcStrategy(Strategy):
             submit_order_fn    = self._make_submit_fn(),
             log                = self.log,
             strategy_id        = str(cfg.strategy_id),
+            symbol             = self._symbol,
             notifier           = self._notifier,
             on_order_submitted = self._make_on_order_submitted(),
             balance_check_fn   = balance_fn,
@@ -336,9 +342,10 @@ class BaseSmcStrategy(Strategy):
 
         self.log.info(
             f"{str(cfg.strategy_id):<20} started  mode={cfg.mode}  "
+            f"venue={cfg.venue}  symbol={self._symbol}  "
             f"primary={cfg.bar_type}  "
             f"htf={'off' if not cfg.htf_filter else str(cfg.bar_type_htf)}  "
-            f"size={cfg.trade_size} BTC  max_open={cfg.max_open_trades}  "
+            f"size={cfg.trade_size} {self._symbol}  max_open={cfg.max_open_trades}  "
             f"daily_limit={cfg.daily_loss_limit_usdt:.2f}  "
             f"margin_gate={cfg.min_free_margin_usdt:.2f} USDT  "
             f"reconciler={'on' if self._reconciler else 'off'}"
@@ -423,8 +430,9 @@ class BaseSmcStrategy(Strategy):
         # ── Stage 6: reconciliation — before signal/SL/TP logic ───────
         # Runs after all fills from the previous bar are settled.
         # Skips silently if within grace period or portfolio not ready.
+        # Scoped to this strategy's own (venue, instrument) group.
         if self._reconciler is not None:
-            self._reconciler.check(ts, self.log)
+            self._reconciler.check(cfg.venue, cfg.instrument_id, ts, self.log)
 
         atr, raw_long, raw_short = self._process_primary_bar(
             high, low, close, self._bar_count
@@ -444,8 +452,10 @@ class BaseSmcStrategy(Strategy):
             long_signal  = raw_long
             short_signal = raw_short
 
-        # ── Stage 6: suppress new entries if reconciler halted (Case B)
-        if self._reconciler is not None and self._reconciler.is_halted:
+        # ── Stage 6: suppress new entries if this group is halted (Case B)
+        # Only halts entries for this strategy's own (venue, instrument)
+        # group -- a halt on one symbol/venue doesn't affect others.
+        if self._reconciler is not None and self._reconciler.is_halted(cfg.venue, cfg.instrument_id):
             long_signal  = False
             short_signal = False
 
@@ -473,9 +483,10 @@ class BaseSmcStrategy(Strategy):
                     self.state_store.save(self.ledger, self._order_to_trade)
                 except Exception as e:
                     self.log.error(f"State save failed after trade event: {e}")
-                # Stage 6: start grace period from this bar's timestamp
+                # Stage 6: start grace period from this bar's timestamp,
+                # scoped to this strategy's (venue, instrument) group
                 if self._reconciler is not None:
-                    self._reconciler.record_mutation(ts)
+                    self._reconciler.record_mutation(cfg.venue, cfg.instrument_id, ts)
 
     # ── Stage 5: order event handlers ─────────────────────────────────────
     def on_order_rejected(self, event) -> None:
@@ -606,7 +617,7 @@ class BaseSmcStrategy(Strategy):
         def _submit(side: str, qty: Decimal, reduce_only: bool = False) -> Optional[str]:
             if self.config.mode == "dry_run":
                 self.log.info(
-                    f"DRY_RUN {side:<4}  {float(qty):.6f} BTC  "
+                    f"DRY_RUN {side:<4}  {float(qty):.6f} {self._symbol}  "
                     f"[{str(self.config.strategy_id)}]"
                 )
                 return None
@@ -633,17 +644,23 @@ class BaseSmcStrategy(Strategy):
 
     def _make_balance_check_fn(self):
         """
-        Returns free USDT from NT portfolio.
+        Returns free margin currency balance from NT portfolio, for this
+        strategy's own venue and instrument (quote currency -- e.g. USDT
+        for a *USDT-margined symbol, but derived from the instrument
+        rather than hardcoded so a non-USDT-margined symbol on a future
+        venue doesn't silently break the gate).
         Used only in paper/live mode — dry_run receives None instead.
         Returns float('inf') when account data isn't available yet
         (e.g. early in startup) so the margin gate never fires spuriously.
         """
+        venue = Venue(get_adapter(self.config.venue).venue_name)
+
         def _check() -> float:
             try:
-                account = self.portfolio.account(Venue("BINANCE"))
-                if account is None:
+                account = self.portfolio.account(venue)
+                if account is None or self.instrument is None:
                     return float("inf")
-                bal = account.balance_free(USDT)
+                bal = account.balance_free(self.instrument.quote_currency)
                 return float(bal.as_double()) if bal is not None else 0.0
             except Exception:
                 return float("inf")
@@ -651,7 +668,8 @@ class BaseSmcStrategy(Strategy):
 
     def _make_position_fn(self):
         """
-        Stage 6: Returns the signed net BTC position from NT's portfolio.
+        Stage 6: Returns the signed net position (in this strategy's own
+        instrument) from NT's portfolio.
         Positive = net long, negative = net short, 0.0 = flat.
         Returns None when the portfolio isn't ready (skip check).
         """
@@ -667,13 +685,13 @@ class BaseSmcStrategy(Strategy):
         """Manual-check quality log. Stage 6 adds automated comparison."""
         sep = "═" * 55
         self.log.warning(sep)
-        self.log.warning(f"RECONCILIATION CHECK — {self.config.strategy_id}")
+        self.log.warning(f"RECONCILIATION CHECK — {self.config.strategy_id}  ({self._symbol})")
         self.log.warning("Trades restored from persistence:")
         for t in self.ledger.open_trades:
             remaining = float(t.full_qty) * (0.5 if t.tp1_hit else 1.0)
             self.log.warning(
                 f"  #{t.trade_id:05d} {t.side:<5}  "
-                f"{remaining:.4f} BTC  entry={t.entry_price:.2f}  "
+                f"{remaining:.4f} {self._symbol}  entry={t.entry_price:.2f}  "
                 f"sl={t.sl:.2f}  tp1_hit={t.tp1_hit}  "
                 f"pnl_so_far={t.realized_pnl:+.2f}"
             )

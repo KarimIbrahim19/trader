@@ -1,18 +1,35 @@
 """
 core/config.py
 ────────────────────────────────────────────────────────────────────────
-Stage 6: Added ReconciliationSettings dataclass.
-Controls the LedgerReconciler (grace period, tolerance).
-Loaded from the `reconciliation:` YAML block.
+Multi-exchange refactor:
+  • Removed the single global `instrument:`/`futures:` blocks. Replaced
+    with a `venues:` block (connection-level: account type; credentials
+    resolved by env-var convention -- see VenueCredentials) and a
+    `symbols:` block keyed by "venue:SYMBOL" (exchange-account-level:
+    nt_id, leverage, margin type, exchange filter fallbacks).
+  • Every strategy now declares its own `venue:` and `symbol:` in its
+    YAML block. Multiple strategies may share a (venue, symbol) pair
+    (as MS + FVG currently share BTCUSDT on Binance) -- leverage/margin
+    are defined once per (venue, symbol), not per strategy, since
+    they're properties of the exchange account, not the strategy.
+  • ReconciliationSettings unchanged from Stage 6 -- grouping by
+    (venue, instrument) now happens in risk/reconciler.py.
+
+Env var convention for venue credentials (see config/.env.example):
+    {VENUE}_API_KEY / {VENUE}_API_SECRET                   (live)
+    {VENUE}_TESTNET_API_KEY / {VENUE}_TESTNET_API_SECRET   (paper)
+  e.g. venue "binance" -> BINANCE_API_KEY, BINANCE_TESTNET_API_KEY, ...
+  Adding a new venue to YAML automatically looks for its own env vars --
+  no code changes needed here.
 """
 
 from __future__ import annotations
 
 import logging
 import os
-from dataclasses import dataclass, fields
+from dataclasses import dataclass, field, fields
 from pathlib import Path
-from typing import Dict
+from typing import Dict, Tuple
 
 import yaml
 from dotenv import load_dotenv
@@ -23,6 +40,8 @@ log = logging.getLogger(__name__)
 @dataclass
 class StrategySettingsBase:
     strategy_id:           str
+    venue:                 str    # e.g. "binance" -- must match a key under `venues:`
+    symbol:                str    # e.g. "BTCUSDT" -- must match a "venue:SYMBOL" key under `symbols:`
     primary_bar:           str
     htf_bar:               str
     trade_size:            float
@@ -43,7 +62,7 @@ class StrategySettingsBase:
     warmup_bars:           int
     htf_warmup_bars:       int
 
-    def build_config(self, strategy_id, instrument_id, state_dir, mode, primary_bar, htf_bar):
+    def build_config(self, strategy_id, instrument_id, venue, state_dir, mode, primary_bar, htf_bar):
         raise NotImplementedError(
             f"{self.__class__.__name__} must implement build_config(). "
             "See MsSettings or FvgSettings for the pattern."
@@ -54,12 +73,16 @@ class StrategySettingsBase:
 @dataclass
 class ReconciliationSettings:
     """
-    Controls the LedgerReconciler. All strategies share one reconciler
-    since under NETTING there is one blended exchange position.
+    Controls the LedgerReconciler. Grouped by (venue, instrument) as of
+    the multi-exchange refactor -- strategies trading different symbols
+    or different venues no longer share one exposure check.
 
     grace_secs:    seconds after a ledger mutation before the next check
                    runs. Prevents false positives during in-flight orders.
     tolerance_btc: differences smaller than this (rounding/fees) are OK.
+                   Named `_btc` for historical reasons -- applies to the
+                   base-asset quantity of whichever instrument a group
+                   is tracking, not literally BTC.
     enabled:       false = reconciler disabled entirely (dry_run always
                    skips regardless of this flag).
     """
@@ -69,28 +92,30 @@ class ReconciliationSettings:
 
 
 @dataclass
-class FuturesSettings:
+class VenueSettings:
     """
-    Leverage + margin type applied to the instrument symbol on Binance
-    Futures.  Leverage can be changed at any time (safe with open
-    positions).  Margin type can ONLY be changed when the position
-    for that symbol is ZERO — Binance rejects the call with error
-    -4046 if a position exists.
-
-    If ``margin_type`` is None (omitted from YAML), no margin-type
-    API call is made during startup; Nautilus uses whatever the
-    exchange account currently has configured.
+    Connection-level settings for one exchange venue.
+    Keyed by venue name (lowercase) under the `venues:` YAML block.
     """
-    leverage:    int
-    margin_type: str | None = None
+    account_type: str
 
 
 @dataclass
-class InstrumentSettings:
-    symbol:       str
-    nt_id:        str
-    venue:        str
-    account_type: str
+class VenueCredentials:
+    """
+    API credentials for one venue, resolved from environment variables
+    by naming convention: {VENUE}_API_KEY / {VENUE}_API_SECRET (live),
+    {VENUE}_TESTNET_API_KEY / {VENUE}_TESTNET_API_SECRET (paper).
+    """
+    api_key:            str = ""
+    api_secret:         str = ""
+    testnet_api_key:    str = ""
+    testnet_api_secret: str = ""
+
+    def active(self, is_paper: bool) -> Tuple[str, str]:
+        if is_paper:
+            return self.testnet_api_key, self.testnet_api_secret
+        return self.api_key, self.api_secret
 
 
 @dataclass
@@ -105,19 +130,19 @@ class MinNotionalSettings:
 
 
 @dataclass
-class SymbolFilterSettings:
-    market_lot_size: MarketLotSizeSettings
-    min_notional:    MinNotionalSettings
-
-
-@dataclass
-class ExchangeFiltersSettings:
-    """Per-symbol exchange filter fallbacks.
-    Populated from the ``exchange_filters:`` YAML block.
-    The API (GET /fapi/v1/exchangeInfo) is always tried first;
-    these values are used only if the API call fails.
+class SymbolSettings:
     """
-    symbols: dict[str, SymbolFilterSettings]  # keyed by symbol e.g. "BTCUSDT"
+    Exchange-account-level settings for one (venue, symbol) pair.
+    Keyed by "venue:SYMBOL" (e.g. "binance:BTCUSDT") under the
+    `symbols:` YAML block. Shared by every strategy trading that
+    symbol on that venue -- leverage/margin type are properties of
+    the exchange account+symbol, not of any one strategy.
+    """
+    nt_id:           str
+    leverage:        int
+    margin_type:     str | None = None
+    market_lot_size: MarketLotSizeSettings = field(default_factory=MarketLotSizeSettings)
+    min_notional:    MinNotionalSettings   = field(default_factory=MinNotionalSettings)
 
 
 @dataclass
@@ -153,19 +178,15 @@ class TelegramSettings:
 @dataclass
 class Settings:
     mode:              str
-    instrument:        InstrumentSettings
-    futures:           FuturesSettings
+    venues:            Dict[str, VenueSettings]
+    symbols:           Dict[Tuple[str, str], SymbolSettings]   # key: (venue_lower, SYMBOL_upper)
     strategies:        Dict[str, StrategySettingsBase]
     redis:             RedisSettings
     logging:           LoggingSettings
     telegram:          TelegramSettings
     trader_id:         str
     reconciliation:    ReconciliationSettings = None  # Stage 6; default below
-    exchange_filters:  ExchangeFiltersSettings | None = None
-    binance_api_key:            str = ""
-    binance_api_secret:         str = ""
-    binance_testnet_api_key:    str = ""
-    binance_testnet_api_secret: str = ""
+    venue_credentials: Dict[str, VenueCredentials] = field(default_factory=dict)
 
     def __post_init__(self):
         if self.reconciliation is None:
@@ -180,19 +201,27 @@ class Settings:
     @property
     def is_dry_run(self) -> bool: return self.mode == "dry_run"
 
-    def symbol_filters(self, symbol: str) -> SymbolFilterSettings | None:
-        """Return exchange filter fallback for *symbol*, or None."""
-        if self.exchange_filters is None:
-            return None
-        return self.exchange_filters.symbols.get(symbol)
+    def symbol_settings(self, venue: str, symbol: str) -> SymbolSettings:
+        """
+        Look up the (venue, symbol) exchange-account settings. Raises if
+        missing -- every strategy's (venue, symbol) pair must have a
+        corresponding entry under `symbols:` in settings.yaml.
+        """
+        key = (venue.lower(), symbol.upper())
+        settings = self.symbols.get(key)
+        if settings is None:
+            raise ValueError(
+                f"No 'symbols' entry for '{venue.lower()}:{symbol.upper()}'. "
+                "Add one under the 'symbols:' block in settings.yaml."
+            )
+        return settings
 
-    @property
-    def active_api_key(self) -> str:
-        return self.binance_testnet_api_key if self.is_paper else self.binance_api_key
-
-    @property
-    def active_api_secret(self) -> str:
-        return self.binance_testnet_api_secret if self.is_paper else self.binance_api_secret
+    def credentials_for(self, venue: str) -> Tuple[str, str]:
+        """Return (api_key, api_secret) active for the current mode."""
+        creds = self.venue_credentials.get(venue.lower())
+        if creds is None:
+            return "", ""
+        return creds.active(self.is_paper)
 
     @property
     def enabled_strategies(self) -> Dict[str, StrategySettingsBase]:
@@ -219,28 +248,72 @@ def load_settings(config_dir=None, settings_file="settings.yaml") -> Settings:
     if mode not in {"dry_run", "paper", "live"}:
         raise ValueError(f"Invalid mode '{mode}'. Must be: dry_run | paper | live")
 
+    # ── Venues ──────────────────────────────────────────────────────────────
+    venues_raw = raw.get("venues", {})
+    venues: Dict[str, VenueSettings] = {}
+    venue_credentials: Dict[str, VenueCredentials] = {}
+    for vname, v in venues_raw.items():
+        vkey = vname.lower()
+        venues[vkey] = VenueSettings(account_type=v["account_type"])
+        env_prefix = vname.upper()
+        venue_credentials[vkey] = VenueCredentials(
+            api_key            = os.getenv(f"{env_prefix}_API_KEY", ""),
+            api_secret         = os.getenv(f"{env_prefix}_API_SECRET", ""),
+            testnet_api_key    = os.getenv(f"{env_prefix}_TESTNET_API_KEY", ""),
+            testnet_api_secret = os.getenv(f"{env_prefix}_TESTNET_API_SECRET", ""),
+        )
+
+    # ── Symbols (per venue+symbol exchange-account settings) ────────────────
+    symbols_raw = raw.get("symbols", {})
+    symbols: Dict[Tuple[str, str], SymbolSettings] = {}
+    for key, s in symbols_raw.items():
+        if ":" not in key:
+            raise ValueError(
+                f"'symbols' key '{key}' must be formatted 'venue:SYMBOL' "
+                "(e.g. 'binance:BTCUSDT')."
+            )
+        vname, sym = key.split(":", 1)
+        mls_raw = s.get("market_lot_size", {})
+        mn_raw  = s.get("min_notional", {})
+        symbols[(vname.lower(), sym.upper())] = SymbolSettings(
+            nt_id       = s["nt_id"],
+            leverage    = s["leverage"],
+            margin_type = s.get("margin_type"),
+            market_lot_size = MarketLotSizeSettings(
+                min_qty   = mls_raw.get("min_qty", 0.001),
+                step_size = mls_raw.get("step_size", 0.001),
+            ),
+            min_notional = MinNotionalSettings(
+                notional = mn_raw.get("notional", 50.0),
+            ),
+        )
+
+    # ── Strategies ────────────────────────────────────────────────────────
+    # The YAML key (e.g. "ms", "ms_eth") is the strategy *instance* name --
+    # used for logging, Telegram, state-file naming, and reconciler
+    # bookkeeping. It no longer has to match a REGISTRY key: an optional
+    # `type:` field selects which strategy class/settings to use, so the
+    # same strategy type can run multiple instances (e.g. MS on both
+    # BTCUSDT and ETHUSDT). If `type:` is omitted, the instance name
+    # itself is used as the type (backward compatible with existing
+    # configs where e.g. the "ms" block implicitly means type "ms").
     from strategies import REGISTRY
     strategies: Dict[str, StrategySettingsBase] = {}
     for name, s in raw.get("strategies", {}).items():
-        entry = REGISTRY.get(name)
+        strategy_type = s.get("type", name)
+        entry = REGISTRY.get(strategy_type)
         if entry is None:
             raise ValueError(
-                f"Unknown strategy '{name}'. Available: {list(REGISTRY)}. "
-                "Add a REGISTRY entry in strategies/__init__.py"
+                f"strategies.{name}: unknown type '{strategy_type}'. "
+                f"Available: {list(REGISTRY)}. Add a REGISTRY entry in "
+                "strategies/__init__.py, or fix the 'type:' field."
             )
         settings_cls = entry["settings"]
         known = {f.name for f in fields(settings_cls)}
-        extra = [k for k in s if k not in known]
+        extra = [k for k in s if k not in known and k != "type"]
         if extra:
             log.warning("strategies.%s: unknown key(s) %s — ignored.", name, extra)
         strategies[name] = settings_cls(**{k: v for k, v in s.items() if k in known})
-
-    # ── Futures leverage / margin type ─────────────────────────────────────
-    futures_raw = raw.get("futures", {})
-    futures = FuturesSettings(
-        leverage    = futures_raw["leverage"],
-        margin_type = futures_raw.get("margin_type"),  # None → no API call
-    )
 
     # ── Reconciliation block (optional — defaults used if absent) ─────────
     rec_raw = raw.get("reconciliation", {})
@@ -250,39 +323,17 @@ def load_settings(config_dir=None, settings_file="settings.yaml") -> Settings:
         tolerance_btc = rec_raw.get("tolerance_btc", 0.0001),
     )
 
-    # ── Exchange filters fallback ──────────────────────────────────────────
-    ef_raw = raw.get("exchange_filters", {})
-    exchange_filters = None
-    if ef_raw:
-        parsed_symbols = {}
-        for sym, sym_raw in ef_raw.items():
-            mls_raw  = sym_raw.get("market_lot_size", {})
-            mn_raw   = sym_raw.get("min_notional", {})
-            parsed_symbols[sym.upper()] = SymbolFilterSettings(
-                market_lot_size = MarketLotSizeSettings(
-                    min_qty   = mls_raw.get("min_qty", 0.001),
-                    step_size = mls_raw.get("step_size", 0.001),
-                ),
-                min_notional = MinNotionalSettings(
-                    notional = mn_raw.get("notional", 50.0),
-                ),
-            )
-        exchange_filters = ExchangeFiltersSettings(symbols=parsed_symbols)
-
-    inst_raw  = raw["instrument"]
     redis_raw = raw["redis"]
     log_raw   = raw["logging"]
     tg_raw    = raw["telegram"]
 
     settings = Settings(
-        mode           = mode,
-        trader_id      = raw["trader_id"],
-        futures        = futures,
-        reconciliation = reconciliation,
-        exchange_filters = exchange_filters,
-        instrument = InstrumentSettings(
-            **{k: inst_raw[k] for k in ["symbol", "nt_id", "venue", "account_type"]}
-        ),
+        mode              = mode,
+        trader_id         = raw["trader_id"],
+        venues            = venues,
+        symbols           = symbols,
+        venue_credentials = venue_credentials,
+        reconciliation    = reconciliation,
         strategies = strategies,
         redis = RedisSettings(
             host         = os.getenv("REDIS_HOST", redis_raw["host"]),
@@ -308,10 +359,6 @@ def load_settings(config_dir=None, settings_file="settings.yaml") -> Settings:
             bot_token = os.getenv("TELEGRAM_BOT_TOKEN", ""),
             chat_id   = os.getenv("TELEGRAM_CHAT_ID", ""),
         ),
-        binance_api_key            = os.getenv("BINANCE_API_KEY", ""),
-        binance_api_secret         = os.getenv("BINANCE_API_SECRET", ""),
-        binance_testnet_api_key    = os.getenv("BINANCE_TESTNET_API_KEY", ""),
-        binance_testnet_api_secret = os.getenv("BINANCE_TESTNET_API_SECRET", ""),
     )
     _validate(settings)
     return settings
@@ -319,29 +366,53 @@ def load_settings(config_dir=None, settings_file="settings.yaml") -> Settings:
 
 def _validate(s: Settings) -> None:
     errors = []
-    if s.is_paper:
-        if not s.binance_testnet_api_key:
-            errors.append("mode=paper requires BINANCE_TESTNET_API_KEY in config/.env")
-        if not s.binance_testnet_api_secret:
-            errors.append("mode=paper requires BINANCE_TESTNET_API_SECRET in config/.env")
-    if s.is_live:
-        if not s.binance_api_key:
-            errors.append("mode=live requires BINANCE_API_KEY in config/.env")
-        if not s.binance_api_secret:
-            errors.append("mode=live requires BINANCE_API_SECRET in config/.env")
+
+    if not s.venues:
+        errors.append("No venues defined in settings.yaml — add a 'venues:' block.")
+    if not s.strategies:
+        errors.append("No strategies defined in settings.yaml")
+
     if s.telegram.enabled:
         if not s.telegram.bot_token:
             errors.append("telegram.enabled=true requires TELEGRAM_BOT_TOKEN in config/.env")
         if not s.telegram.chat_id:
             errors.append("telegram.enabled=true requires TELEGRAM_CHAT_ID in config/.env")
-    if not s.strategies:
-        errors.append("No strategies defined in settings.yaml")
+
     for name, st in s.strategies.items():
         if not st.enabled:
             continue
         prefix = f"strategies.{name}"
         if not st.strategy_id:
             errors.append(f"{prefix}: strategy_id is required")
+
+        if not st.venue:
+            errors.append(f"{prefix}: venue is required")
+        elif st.venue.lower() not in s.venues:
+            errors.append(
+                f"{prefix}: venue '{st.venue}' not defined under 'venues:' in settings.yaml"
+            )
+
+        if not st.symbol:
+            errors.append(f"{prefix}: symbol is required")
+        elif st.venue and (st.venue.lower(), st.symbol.upper()) not in s.symbols:
+            errors.append(
+                f"{prefix}: no 'symbols' entry for "
+                f"'{st.venue.lower()}:{st.symbol.upper()}' — "
+                "add one under the 'symbols:' block in settings.yaml"
+            )
+
+        if st.venue and st.venue.lower() in s.venues and not s.is_dry_run:
+            creds = s.venue_credentials.get(st.venue.lower())
+            key, secret = creds.active(s.is_paper) if creds else ("", "")
+            if not key or not secret:
+                env_kind = "TESTNET_" if s.is_paper else ""
+                env_prefix = st.venue.upper()
+                errors.append(
+                    f"{prefix}: mode={s.mode} requires "
+                    f"{env_prefix}_{env_kind}API_KEY / {env_prefix}_{env_kind}API_SECRET "
+                    "in config/.env"
+                )
+
         if st.tp1_atr <= st.sl_atr:
             errors.append(f"{prefix}: tp1_atr ({st.tp1_atr}) must be > sl_atr ({st.sl_atr})")
         if st.trade_size <= 0:
@@ -354,14 +425,19 @@ def _validate(s: Settings) -> None:
             errors.append(f"{prefix}: trail_atr_mult must be > 0 when trailing_tp2=true")
         if st.min_free_margin_usdt < 0:
             errors.append(f"{prefix}: min_free_margin_usdt must be >= 0 (use 0.0 to disable)")
-    if s.futures.leverage < 1:
-        errors.append("futures.leverage must be >= 1")
-    if s.futures.margin_type is not None and s.futures.margin_type not in {"CROSSED", "ISOLATED"}:
-        errors.append("futures.margin_type must be 'CROSSED' or 'ISOLATED' when present")
+
+    for (vkey, sym), sym_cfg in s.symbols.items():
+        sprefix = f"symbols.{vkey}:{sym}"
+        if sym_cfg.leverage < 1:
+            errors.append(f"{sprefix}: leverage must be >= 1")
+        if sym_cfg.margin_type is not None and sym_cfg.margin_type not in {"CROSSED", "ISOLATED"}:
+            errors.append(f"{sprefix}: margin_type must be 'CROSSED' or 'ISOLATED' when present")
+
     if s.reconciliation.grace_secs < 0:
         errors.append("reconciliation.grace_secs must be >= 0")
     if s.reconciliation.tolerance_btc < 0:
         errors.append("reconciliation.tolerance_btc must be >= 0")
+
     if errors:
         msg = "\n".join(f"  • {e}" for e in errors)
         raise ValueError(f"Configuration errors:\n{msg}")

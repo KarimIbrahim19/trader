@@ -37,7 +37,7 @@ def check_config(config_path: str):
         from core.config import load_settings
         settings = load_settings(Path(config_path).parent, Path(config_path).name)
         _ok(f"settings.yaml loaded  (mode={settings.mode})")
-        _ok(f"Instrument : {settings.instrument.nt_id}")
+        _ok(f"Venues defined: {', '.join(settings.venues) or '(none)'}")
 
         if not settings.strategies:
             _fail("No strategies defined in settings.yaml")
@@ -46,10 +46,17 @@ def check_config(config_path: str):
         for name, s in settings.strategies.items():
             status = "\033[32mENABLED\033[0m" if s.enabled else "\033[90mdisabled\033[0m"
             print(f"\n  Strategy [{status}] \033[1m{name.upper()}\033[0m")
+            _ok(f"  venue={s.venue}  symbol={s.symbol}")
             _ok(f"  bars: primary={s.primary_bar}  htf={s.htf_bar}  htf_filter={s.htf_filter}")
             if s.enabled:
+                try:
+                    sym_cfg = settings.symbol_settings(s.venue, s.symbol)
+                    _ok(f"  instrument: {sym_cfg.nt_id}  leverage={sym_cfg.leverage}  "
+                        f"margin_type={sym_cfg.margin_type or '(unset)'}")
+                except ValueError as e:
+                    _fail(f"  {e}")
                 _ok(
-                    f"  risk: size={s.trade_size} BTC  "
+                    f"  risk: size={s.trade_size}  "
                     f"SL={s.sl_atr}×  TP1={s.tp1_atr}×  TP2={s.tp2_atr}×  "
                     f"BE={s.breakeven_sl}  trailing={s.trailing_tp2}"
                 )
@@ -125,70 +132,45 @@ def check_redis(settings) -> bool:
         return False
 
 
-# ── 4. Binance connectivity ───────────────────────────────────────────────
-def check_binance_connectivity() -> bool:
-    _section("4. Binance Futures API (network reachability)")
-    endpoints = [
-        ("fapi.binance.com",    443, "Futures REST API"),
-        ("fstream.binance.com", 443, "Futures WebSocket"),
-    ]
+# ── 4. Exchange connectivity (per venue, via adapter) ─────────────────────
+def check_exchange_connectivity(settings) -> bool:
+    _section("4. Exchange API connectivity (network reachability)")
+    from core.exchanges import get_adapter
     all_ok = True
-    for host, port, label in endpoints:
-        try:
-            t0 = time.time()
-            sock = socket.create_connection((host, port), timeout=10)
-            latency = (time.time() - t0) * 1000
-            sock.close()
-            _ok(f"{label}  ({host}:{port})  latency={latency:.0f}ms")
-        except Exception as e:
-            _fail(f"{label}  ({host}:{port})  unreachable: {e}")
-            all_ok = False
+    for venue in settings.venues:
+        adapter = get_adapter(venue)
+        for host, port, label in adapter.connectivity_endpoints():
+            try:
+                t0 = time.time()
+                sock = socket.create_connection((host, port), timeout=10)
+                latency = (time.time() - t0) * 1000
+                sock.close()
+                _ok(f"[{venue}] {label}  ({host}:{port})  latency={latency:.0f}ms")
+            except Exception as e:
+                _fail(f"[{venue}] {label}  ({host}:{port})  unreachable: {e}")
+                all_ok = False
     return all_ok
 
 
-# ── 5. Binance API keys ───────────────────────────────────────────────────
-def check_binance_api_keys(settings) -> bool:
-    _section("5. Binance API key validity")
+# ── 5. Exchange API keys (per venue, via adapter) ─────────────────────────
+def check_exchange_api_keys(settings) -> bool:
+    _section("5. Exchange API key validity")
     if settings.is_dry_run:
         _warn("mode=dry_run — skipping API key validation (keys not needed)")
         return True
 
-    key    = settings.active_api_key
-    secret = settings.active_api_secret
-    if not key or not secret:
-        _fail("API keys not set in config/.env (see .env.example)")
-        return False
-
-    try:
-        import hashlib, hmac, json as _json, urllib.request, urllib.parse
-        base = "https://testnet.binancefuture.com" if settings.is_paper else "https://fapi.binance.com"
-        label = "testnet" if settings.is_paper else "live"
-        ts        = int(time.time() * 1000)
-        params    = f"timestamp={ts}"
-        signature = hmac.new(secret.encode(), params.encode(), hashlib.sha256).hexdigest()
-        url = f"{base}/fapi/v2/account?{params}&signature={signature}"
-        req = urllib.request.Request(url, headers={"X-MBX-APIKEY": key})
-        with urllib.request.urlopen(req, timeout=10) as resp:
-            data = _json.loads(resp.read())
-        balance = next(
-            (float(a["walletBalance"]) for a in data.get("assets", []) if a["asset"] == "USDT"),
-            None,
-        )
-        _ok(f"API key valid ({label})")
-        if balance is not None:
-            _ok(f"USDT wallet balance: {balance:,.2f}")
-        return True
-    except urllib.error.HTTPError as e:
-        if e.code == 401:
-            _fail("API key rejected (401) — check key and secret")
-        elif e.code == 403:
-            _fail("API key lacks Futures permission")
+    from core.exchanges import get_adapter
+    all_ok = True
+    for venue in settings.venues:
+        adapter = get_adapter(venue)
+        creds   = settings.credentials_for(venue)
+        result  = adapter.validate_api_key(creds, settings.is_paper)
+        if result["ok"]:
+            _ok(f"[{venue}] {result['detail']}")
         else:
-            _fail(f"HTTP {e.code}: {e.reason}")
-        return False
-    except Exception as e:
-        _fail(f"API key check failed: {e}")
-        return False
+            _fail(f"[{venue}] {result['detail']}")
+            all_ok = False
+    return all_ok
 
 
 # ── 6. Telegram ───────────────────────────────────────────────────────────
@@ -214,7 +196,7 @@ def check_telegram(settings) -> bool:
         msg_url = f"https://api.telegram.org/bot{token}/sendMessage"
         payload = _json.dumps({
             "chat_id": chat_id,
-            "text": "✅ BTC Trader — infrastructure check passed.",
+            "text": "✅ Live Trader — infrastructure check passed.",
         }).encode()
         req2 = urllib.request.Request(msg_url, data=payload,
                                        headers={"Content-Type": "application/json"})
@@ -324,12 +306,12 @@ def check_state_files() -> bool:
 
 # ── Main ──────────────────────────────────────────────────────────────────
 def main() -> None:
-    parser = argparse.ArgumentParser(description="BTC Trader — infrastructure check")
+    parser = argparse.ArgumentParser(description="Live Trader — infrastructure check")
     parser.add_argument("--config", default="config/settings.yaml")
     args = parser.parse_args()
 
     print("\n" + "═" * 60)
-    print("  BTC Trader — Infrastructure Check")
+    print("  Live Trader — Infrastructure Check")
     print("═" * 60)
 
     config_path = Path(args.config)
@@ -341,8 +323,8 @@ def main() -> None:
 
     env_ok      = check_env_file(config_path.parent)
     redis_ok    = check_redis(settings)
-    network_ok  = check_binance_connectivity()
-    api_ok      = check_binance_api_keys(settings)
+    network_ok  = check_exchange_connectivity(settings)
+    api_ok      = check_exchange_api_keys(settings)
     tg_ok       = check_telegram(settings)
     modules_ok  = check_signal_modules()
     strategy_ok = check_strategy_modules()
@@ -354,7 +336,7 @@ def main() -> None:
         "Environment":      env_ok,
         "Redis":            redis_ok,
         "Network":          network_ok,
-        "Binance API":      api_ok,
+        "Exchange API":     api_ok,
         "Telegram":         tg_ok,
         "Signal modules":   modules_ok,
         "Strategy modules":  strategy_ok,

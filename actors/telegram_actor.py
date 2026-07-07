@@ -120,8 +120,8 @@ class TelegramNotifier:
         for name, s in enabled_strats.items():
             htf_part = f"+{s.htf_bar}" if s.htf_filter else ""
             lines.append(
-                f"▪ <b>{name.upper()}</b>  {s.primary_bar}{htf_part}  "
-                f"size={s.trade_size} BTC"
+                f"▪ <b>{name.upper()}</b>  {s.venue}:{s.symbol}  {s.primary_bar}{htf_part}  "
+                f"size={s.trade_size}"
             )
         self.send("\n".join(lines))
 
@@ -174,7 +174,7 @@ class TelegramNotifier:
             f"No new entries until next restart"
         )
 
-    def on_trade_opened(self, trade: OpenTrade, strategy_id: str) -> None:
+    def on_trade_opened(self, trade: OpenTrade, strategy_id: str, symbol: str = "") -> None:
         if not self._enabled or not self._notify_entries: return
         icon = "🟢" if trade.side == "LONG" else "🔴"
         self.send(
@@ -183,10 +183,10 @@ class TelegramNotifier:
             f"SL     <code>{_fmt_price(trade.sl)}</code>\n"
             f"TP1    <code>{_fmt_price(trade.tp1)}</code>\n"
             f"TP2    <code>{_fmt_price(trade.tp2)}</code>\n"
-            f"Size   {trade.full_qty} BTC"
+            f"Size   {trade.full_qty}" + (f" {symbol}" if symbol else "")
         )
 
-    def on_tp1_hit(self, trade: OpenTrade, strategy_id: str, leg_pnl: float) -> None:
+    def on_tp1_hit(self, trade: OpenTrade, strategy_id: str, leg_pnl: float, symbol: str = "") -> None:
         if not self._enabled or not self._notify_exits: return
         be_note = "  (SL → breakeven)" if self._is_breakeven(trade) else ""
         self.send(
@@ -199,7 +199,7 @@ class TelegramNotifier:
 
     def on_trade_closed(
         self, trade: OpenTrade, strategy_id: str,
-        leg_pnl: float, duration_secs: float,
+        leg_pnl: float, duration_secs: float, symbol: str = "",
     ) -> None:
         if not self._enabled or not self._notify_exits: return
         if trade.exit_reason == "RESTART": return
@@ -217,14 +217,15 @@ class TelegramNotifier:
     def on_netted_flip(
         self, strategy_id: str, net_side: str,
         net_qty: str, sum_opposing: str,
-        opposing_count: int, new_qty: str,
+        opposing_count: int, new_qty: str, symbol: str = "",
     ) -> None:
         if not self._enabled: return
         arrow = "⬆️" if net_side == "BUY" else "⬇️"
         new_part = f" + open {new_qty}" if new_qty != "0" else ""
+        unit = f" {symbol}" if symbol else ""
         self.send(
             f"🔄 <b>NETTED FLIP</b>  [{strategy_id}]\n"
-            f"{arrow} <code>{net_side} {net_qty} BTC</code>  "
+            f"{arrow} <code>{net_side} {net_qty}{unit}</code>  "
             f"(close {sum_opposing}{new_part})\n"
             f"Closed {opposing_count} opposing trade(s) atomically"
         )
@@ -270,29 +271,32 @@ class TelegramNotifier:
         actual:    float,
         diff:      float,
         breakdown: dict[str, float],
+        group:     str = "",
     ) -> None:
         """
-        Case A: exchange position is less than expected.
-        Possible external close (liquidation, manual, ADL).
+        Case A: exchange position is less than expected, for the given
+        (venue, instrument) group.
+        Possible external close (liquidation, manual, ADL) -- or an
+        internal ledger bug (see reconcile_case_a_analysis.md).
         Notify only — no auto-correction applied yet.
         """
         if not self._enabled: return
         lines = [
-            "⚠️ <b>RECONCILE WARNING</b>  Case A",
+            "⚠️ <b>RECONCILE WARNING</b>  Case A" + (f"  [{group}]" if group else ""),
             "Exchange shows less exposure than expected",
             "",
-            f"Expected : <code>{expected:+.4f} BTC</code>",
-            f"Actual   : <code>{actual:+.4f} BTC</code>",
-            f"Diff     : <code>{diff:+.4f} BTC</code>",
+            f"Expected : <code>{expected:+.6f}</code>",
+            f"Actual   : <code>{actual:+.6f}</code>",
+            f"Diff     : <code>{diff:+.6f}</code>",
             "",
-            "Possible cause: liquidation, manual close, or ADL",
+            "Possible cause: liquidation, manual close, ADL, or an internal ledger bug",
             "No auto-correction applied — review and confirm manually",
         ]
         if breakdown:
             lines.append("")
             for name, qty in breakdown.items():
                 lines.append(
-                    f"  {name.upper()}: expected <code>{_fmt_qty(qty)} BTC</code>"
+                    f"  {name.upper()}: expected <code>{_fmt_qty(qty)}</code>"
                 )
         self.send("\n".join(lines))
 
@@ -302,20 +306,23 @@ class TelegramNotifier:
         actual:    float,
         diff:      float,
         breakdown: dict[str, float],
+        group:     str = "",
     ) -> None:
         """
-        Case B: exchange position is more than expected.
-        Untracked position — all new entries halted immediately.
-        Requires manual restart to resume trading.
+        Case B: exchange position is more than expected, for the given
+        (venue, instrument) group.
+        Untracked position — new entries for that group halted immediately.
+        Other (venue, instrument) groups keep trading normally.
+        Requires manual restart to resume trading for this group.
         """
         if not self._enabled: return
         lines = [
-            "🚨 <b>RECONCILE HALT</b>  Case B",
-            "Untracked position detected — <b>ALL new entries HALTED</b>",
+            "🚨 <b>RECONCILE HALT</b>  Case B" + (f"  [{group}]" if group else ""),
+            "Untracked position detected — <b>new entries HALTED for this group</b>",
             "",
-            f"Expected : <code>{expected:+.4f} BTC</code>",
-            f"Actual   : <code>{actual:+.4f} BTC</code>",
-            f"Diff     : <code>{diff:+.4f} BTC</code>",
+            f"Expected : <code>{expected:+.6f}</code>",
+            f"Actual   : <code>{actual:+.6f}</code>",
+            f"Diff     : <code>{diff:+.6f}</code>",
             "",
             "⚠️ <b>Manual intervention required</b>",
             "Resolve the discrepancy on the exchange,",
@@ -325,7 +332,7 @@ class TelegramNotifier:
             lines.append("")
             for name, qty in breakdown.items():
                 lines.append(
-                    f"  {name.upper()}: expected <code>{_fmt_qty(qty)} BTC</code>"
+                    f"  {name.upper()}: expected <code>{_fmt_qty(qty)}</code>"
                 )
         self.send("\n".join(lines))
 

@@ -26,13 +26,14 @@ class MsSettings(StrategySettingsBase):
     atr_len:   int
 
     def build_config(
-        self, strategy_id: str, instrument_id: InstrumentId,
+        self, strategy_id: str, instrument_id: InstrumentId, venue: str,
         state_dir: str, mode: str,
         primary_bar: BarType, htf_bar: BarType,
     ) -> MsStrategyConfig:
         return MsStrategyConfig(
             strategy_id           = strategy_id,
             instrument_id         = instrument_id,
+            venue                 = venue,
             bar_type              = primary_bar,
             bar_type_htf          = htf_bar,
             state_dir             = state_dir,

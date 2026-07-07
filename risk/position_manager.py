@@ -58,6 +58,7 @@ class PositionManager:
         submit_order_fn:     SubmitOrderFn,
         log:                 logging.Logger,
         strategy_id:         str = "",
+        symbol:              str = "",
         notifier:            Optional[object] = None,
         on_order_submitted:  OnOrderSubmittedFn = None,
         balance_check_fn:    BalanceCheckFn = None,
@@ -67,6 +68,7 @@ class PositionManager:
         self._submit             = submit_order_fn
         self.log                 = log
         self._strategy_id        = strategy_id
+        self._symbol             = symbol   # e.g. "BTCUSDT" -- for log/notify labeling only
         self._notifier           = notifier
         self._on_order_submitted = on_order_submitted
         self._balance_check_fn   = balance_check_fn
@@ -214,7 +216,7 @@ class PositionManager:
                 f"exit≈{close:.1f}  reason={t.exit_reason}  "
                 f"leg_pnl={leg_pnl:+.2f}  cum_pnl={t.realized_pnl:+.2f}"
             )
-            self._notify("on_trade_closed", t, self._strategy_id, leg_pnl, duration_secs)
+            self._notify("on_trade_closed", t, self._strategy_id, leg_pnl, duration_secs, symbol=self._symbol)
 
         # Purge closed opposing trades from open_trades
         self.ledger.open_trades = [t for t in self.ledger.open_trades if t.exit_ts is None]
@@ -237,7 +239,7 @@ class PositionManager:
                 f"entry≈{close:.1f}  sl={new_sl:.1f}  tp1={new_tp1:.1f}  "
                 f"tp2={new_tp2:.1f}  atr={atr:.1f}  open={self.ledger.open_count}"
             )
-            self._notify("on_trade_opened", new_trade, self._strategy_id)
+            self._notify("on_trade_opened", new_trade, self._strategy_id, symbol=self._symbol)
 
         # Enqueue close and entry separately so the MIN_NOTIONAL split
         # logic in _flush_pending can distinguish them, avoiding the bug
@@ -251,7 +253,7 @@ class PositionManager:
         # Summary log line
         new_part = f"  + open {new_qty}" if can_open_new else ""
         self.log.info(
-            f"FLIP {net_side:<4} {net_qty} BTC  |  "
+            f"FLIP {net_side:<4} {net_qty} {self._symbol or 'units'}  |  "
             f"closed {opposing_count} opposing ({sum_opposing}){new_part}  "
             f"ts={ts}"
         )
@@ -265,6 +267,7 @@ class PositionManager:
             str(sum_opposing),
             opposing_count,
             str(new_qty),
+            symbol=self._symbol,
         )
 
     # ── Entry ─────────────────────────────────────────────────────────────
@@ -302,7 +305,7 @@ class PositionManager:
             f"sl={sl:.1f}  tp1={tp1:.1f}  tp2={tp2:.1f}  "
             f"atr={atr:.1f}  open={self.ledger.open_count}"
         )
-        self._notify("on_trade_opened", trade, self._strategy_id)
+        self._notify("on_trade_opened", trade, self._strategy_id, symbol=self._symbol)
 
     # ── Pending buffer ─────────────────────────────────────────────────────
     def _reset_pending(self) -> None:
@@ -487,7 +490,7 @@ class PositionManager:
                             t.best_price     = t.entry_price
                             t.trail_distance = self.config.trail_atr_mult * atr
                         still_open.append(t)
-                        self._notify("on_tp1_hit", t, self._strategy_id, tp1_leg_pnl)
+                        self._notify("on_tp1_hit", t, self._strategy_id, tp1_leg_pnl, symbol=self._symbol)
                     elif self.config.enable_exit_signal and short_signal:
                         self._close_trade(t, close, 1.0, ts, "exit-signal", final=True, reduce_only=False)
                     else:
@@ -529,7 +532,7 @@ class PositionManager:
                             t.best_price     = t.entry_price
                             t.trail_distance = self.config.trail_atr_mult * atr
                         still_open.append(t)
-                        self._notify("on_tp1_hit", t, self._strategy_id, tp1_leg_pnl)
+                        self._notify("on_tp1_hit", t, self._strategy_id, tp1_leg_pnl, symbol=self._symbol)
                     elif self.config.enable_exit_signal and long_signal:
                         self._close_trade(t, close, 1.0, ts, "exit-signal", final=True, reduce_only=False)
                     else:
@@ -581,7 +584,7 @@ class PositionManager:
             trade.exit_reason = reason
             self.ledger.record_close(trade, final=True)
             duration_secs = (ts - trade.entry_ts) / 1e9
-            self._notify("on_trade_closed", trade, self._strategy_id, pnl, duration_secs)
+            self._notify("on_trade_closed", trade, self._strategy_id, pnl, duration_secs, symbol=self._symbol)
         else:
             self.ledger.record_close(trade, final=False)
 
@@ -684,13 +687,13 @@ class PositionManager:
             )
 
     # ── Notifier helper ───────────────────────────────────────────────────
-    def _notify(self, method: str, *args) -> None:
+    def _notify(self, method: str, *args, **kwargs) -> None:
         if self._notifier is None:
             return
         fn = getattr(self._notifier, method, None)
         if fn is None:
             return
         try:
-            fn(*args)
+            fn(*args, **kwargs)
         except Exception as e:
             self.log.warning(f"Notifier {method} error: {e}")

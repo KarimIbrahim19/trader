@@ -1,45 +1,86 @@
 # ══════════════════════════════════════════════════════════════════════
-#  BTC Trader — main configuration
+#  Live Trader — main configuration
 #  API keys and secrets go in config/.env (never here)
 # ══════════════════════════════════════════════════════════════════════
 
 # ── Trading mode ──────────────────────────────────────────────────────
 # dry_run : live data, signals logged only, NO orders placed
-# paper   : live data, simulated fills (Binance testnet)
-# live    : real orders on real Binance Futures account
+# paper   : live data, simulated fills (testnet, per venue, e.g.:(Binance testnet))
+# live    : real orders on real exchange accounts
+# Applies to every venue below -- there is currently no per-venue mode.
 mode: paper
 
 # ── Instance identity ────────────────────────────────────────────────
 # Must be unique per running instance to prevent Redis key collisions.
-trader_id: CLTRADER-001
+trader_id: LIVETRADER-001
 
-# ── Instrument ────────────────────────────────────────────────────────
-instrument:
-  symbol:       BTCUSDT
-  nt_id:        BTCUSDT-PERP.BINANCE
-  venue:        BINANCE
-  account_type: USDT_FUTURES
+# ── Venues ────────────────────────────────────────────────────────────
+# Connection-level settings, one entry per exchange. Credentials are
+# NOT set here -- they're resolved from config/.env by naming
+# convention: {VENUE}_API_KEY / {VENUE}_API_SECRET (live) and
+# {VENUE}_TESTNET_API_KEY / {VENUE}_TESTNET_API_SECRET (paper). Adding
+# a venue here also requires an adapter in core/exchanges/ (currently
+# only "binance" is implemented).
+venues:
+  binance:
+    account_type: USDT_FUTURES
 
-# ── Futures leverage & margin type ───────────────────────────────────
-# leverage:    Required. Applied via Binance API on every startup.
+# ── Symbols ───────────────────────────────────────────────────────────
+# Exchange-account-level settings, one entry per "venue:SYMBOL" pair.
+# Shared by every strategy trading that symbol on that venue.
+#
+# leverage:    Required. Applied via the exchange API on every startup.
 #              Safe to change anytime, even with open positions.
-# margin_type: Optional. Only set this field when the BTCUSDT position
+# margin_type: Optional. Only set this field when the symbol's position
 #              is ZERO. Binance rejects changes (-4046) if a position
 #              exists. To change with open positions:
 #                1. Remove this field from YAML, restart (no API call).
-#                2. Flatten all BTCUSDT positions.
+#                2. Flatten all positions for that symbol.
 #                3. Re-add with new value, restart.
 #              Valid values: CROSSED | ISOLATED
-futures:
-  leverage:    10
-  margin_type: CROSSED
+# market_lot_size / min_notional: fallback values used only if the
+#              live exchange-info API fetch fails at startup.
+symbols:
+
+  binance:BTCUSDT:
+    nt_id:        BTCUSDT-PERP.BINANCE
+    leverage:     10
+    margin_type:  CROSSED
+    market_lot_size:
+      min_qty:   0.001
+      step_size: 0.001
+    min_notional:
+      notional:  50
 
 # ── Strategies ────────────────────────────────────────────────────────
+# Each block's YAML key is the strategy *instance* name (used in logs,
+# Telegram, state filenames, and reconciler grouping) -- it can be
+# anything. An optional `type:` field selects which strategy class to
+# use (must match a key in strategies/__init__.py's REGISTRY); if
+# omitted, the instance name itself is used as the type (as below,
+# where "ms" implicitly means type: ms). This lets you run the same
+# strategy type on more than one symbol, e.g.:
+#
+#   ms_eth:
+#     type:   ms
+#     venue:  binance
+#     symbol: ETHUSDT
+#     ...
+#
+#It only becomes relevant the day you want, say, MS running on both BTCUSDT and ETHUSDT simultaneously.
+#Then you'd add a second block, give it any name (ms_eth, ms2, whatever), and say type: ms so the loader knows to build another MsStrategy.
+#One thing to watch: strategy_id inside each block must still be unique (it's used for state filenames like state/{strategy_id}_state.json)
+#the YAML key and strategy_id are two separate identifiers that happen to often look similar.
+#If you ever do add a second instance, make sure strategy_id: MS-ETH-001 (or similar) doesn't collide with MS-001.
+
 strategies:
 
-  ms:
+  ms_btc:
     enabled:                  true
     strategy_id:              MS-001
+    type:                     ms
+    venue:                    binance
+    symbol:                   BTCUSDT
     primary_bar:              1m
     swing_len:                10
     atr_dist:                 0.5
@@ -47,24 +88,27 @@ strategies:
     htf_filter:               false
     htf_bar:                  1h
     htf_period:               21
-    trade_size:               0.01     # BTC per trade
+    trade_size:               0.01      # base asset units per trade (BTC for BTCUSDT)
     sl_atr:                   1.5       # stop loss      = sl_atr  × ATR
     tp1_atr:                  2.0       # TP1 (50% close) = tp1_atr × ATR
     tp2_atr:                  3.5       # TP2 (remainder) = tp2_atr × ATR
     trailing_tp2:             false     # false = fixed TP2 level
     trail_atr_mult:           3.5       # trailing callback (only if trailing_tp2: true)
-    breakeven_sl:             true      # move SL to entry once TP1 fires
-    enable_exit_signal:       true      # close on opposite momentum signal
+    breakeven_sl:             false      # move SL to entry once TP1 fires
+    enable_exit_signal:       false      # close on opposite momentum signal
     enable_sl:                true      # enable stop loss
     max_open_trades:          5         # hard cap on simultaneous open trades
     daily_loss_limit_usdt:    50.0      # no new entries if daily PnL < -this
-    min_free_margin_usdt:     50.0      # min free USDT before opening. 0.0 = disabled. dry_run ignores this.
+    min_free_margin_usdt:     50.0      # min free quote-currency balance before opening. 0.0 = disabled. dry_run ignores this.
     warmup_bars:              200
     htf_warmup_bars:          50
 
-  fvg:
+  fvg_btc:
     enabled:                  true
     strategy_id:              FVG-001
+    type:                     fvg
+    venue:                    binance
+    symbol:                   BTCUSDT
     primary_bar:              1m
     fvg_atr_len:              14
     fvg_atr_mult:             0.25
@@ -83,7 +127,7 @@ strategies:
     trailing_tp2:             false
     trail_atr_mult:           3.5
     breakeven_sl:             false
-    enable_exit_signal:       true
+    enable_exit_signal:       false
     enable_sl:                true
     max_open_trades:          3
     daily_loss_limit_usdt:    30.0
@@ -91,24 +135,16 @@ strategies:
     warmup_bars:              250
     htf_warmup_bars:          50
 
-# ── Exchange filters (fallback if API fetch fails) ────────────────────
-# Per-symbol overrides for MARKET_LOT_SIZE and MIN_NOTIONAL from
-# GET /fapi/v1/exchangeInfo. The API is always tried first.
-exchange_filters:
-  BTCUSDT:
-    market_lot_size:
-      min_qty: 0.001
-      step_size: 0.001
-    min_notional:
-      notional: 50
-
 # ── Reconciliation ────────────────────────────────────────────────────
 # Controls the LedgerReconciler (Stage 6). Compares aggregate ledger
-# exposure across all strategies to the single Binance NETTING position.
+# exposure to the exchange NETTING position, independently per
+# (venue, instrument) group -- a strategy on a different symbol or
+# venue never affects another group's check or halt state.
 #
 # Case A (exchange < expected): WARNING + Telegram only. No auto-heal.
-# Case B (exchange > expected): HALT all new entries + CRITICAL alert.
-#                               Restart required to resume trading.
+# Case B (exchange > expected): HALT new entries for that group only
+#                               + CRITICAL alert. Restart required to
+#                               resume trading for that group.
 #
 # Ignored completely in dry_run mode (no portfolio available).
 # Set enabled: false to disable without removing the block.
@@ -132,9 +168,9 @@ logging:
   level:           INFO
   level_file:      DEBUG
   log_dir:         logs
-  log_file_name:   btc_trader.log
-  rotate_mb:       50
-  keep_backups:    5
+  log_file_name:   live_trader.log
+  rotate_mb:       5
+  keep_backups:    10
 
 # ── Telegram ──────────────────────────────────────────────────────────
 telegram:
