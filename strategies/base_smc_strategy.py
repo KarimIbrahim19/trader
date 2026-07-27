@@ -36,7 +36,7 @@ from typing import Optional
 
 from nautilus_trader.config import StrategyConfig
 from nautilus_trader.core.data import Data
-from nautilus_trader.model.data import Bar, BarAggregation, BarType
+from nautilus_trader.model.data import Bar, BarAggregation, BarType, MarkPriceUpdate
 from nautilus_trader.model.enums import OrderSide, TimeInForce
 from nautilus_trader.model.identifiers import InstrumentId, PositionId, Venue
 from nautilus_trader.trading.strategy import Strategy
@@ -115,6 +115,9 @@ class BaseSmcStrategy(Strategy):
 
         # Exchange filter fallback (from settings.yaml, used if API fetch fails)
         self._exchange_filters_fallback: dict = {}
+
+        # Feature 2: sub-bar SL/TP via mark price ticks
+        self._last_mark_ts: int = 0
 
     # ── Wiring (called from main.py before node.build()) ──────────────────
     def set_notifier(self, notifier, strategy_name: str = "") -> None:
@@ -393,6 +396,7 @@ class BaseSmcStrategy(Strategy):
         self.subscribe_bars(cfg.bar_type)
         if cfg.htf_filter:
             self.subscribe_bars(cfg.bar_type_htf)
+        self.subscribe_mark_prices(cfg.instrument_id)
 
     def _on_warmup_timeout(self, event) -> None:
         if not self._warmup_done:
@@ -497,6 +501,27 @@ class BaseSmcStrategy(Strategy):
                 # scoped to this strategy's (venue, instrument) group
                 if self._reconciler is not None:
                     self._reconciler.record_mutation(cfg.venue, cfg.instrument_id, ts)
+
+    # ── Mark price ticks (Feature 2) ──────────────────────────────────────
+    _last_mark_log: dict[str, int] = {}  # instrument_id → ts_init of last log (shared across instances)
+
+    def on_mark_price(self, data: MarkPriceUpdate) -> None:
+        if not self._warmup_done or self.pm is None:
+            return
+        now = data.ts_init
+        if now - self._last_mark_ts < 1_000_000_000:
+            return
+        self._last_mark_ts = now
+        self.pm.on_price(data.value.as_double(), now)
+        if self.pm.flush_state():
+            try:
+                self.state_store.save(self.ledger, self._order_to_trade)
+            except Exception as e:
+                self.log.error(f"State save failed after mark price close: {e}")
+        key = str(self.config.instrument_id)
+        if now - self._last_mark_log.get(key, 0) >= 10_000_000_000:
+            self.log.debug(f"Mark price [{key}]: {data.value.as_double():.1f}")
+            self._last_mark_log[key] = now
 
     # ── Stage 5: order event handlers ─────────────────────────────────────
     def on_order_rejected(self, event) -> None:

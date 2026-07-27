@@ -1,5 +1,27 @@
 # Changelog
 
+## 2026-07-27 — Feature 2: Sub-bar SL/TP via mark price ticks
+
+### Added
+- `risk/position_manager.py` — `on_price()` method checks SL/TP for all open
+  trades against a single price point (high=low=close). Called from the strategy
+  layer on each mark price tick. No new entries — only exits. Submits close
+  orders immediately via `_flush_pending()`.
+- `strategies/base_smc_strategy.py` — `subscribe_mark_prices()` in
+  `_subscribe_live()` subscribes to NT's standard `MarkPriceUpdate` stream for
+  each strategy's instrument.
+- `strategies/base_smc_strategy.py` — `on_mark_price()` handler fires ~1/s.
+  Throttled to once per second (no double-close risk — `exit_ts` guard in
+  `_manage_open_trades()` prevents re-closing). Calls `pm.on_price()` then
+  persists state if dirty.
+- `strategies/base_smc_strategy.py` — Shared class-level `_last_mark_log` dict
+  throttles the diagnostic log to once per 10s per symbol at DEBUG level, so N
+  strategies on the same symbol produce one log line per 10s total.
+
+### Changed
+- `nautilus_trader` import in `strategies/base_smc_strategy.py` — added
+  `MarkPriceUpdate` from `nautilus_trader.model.data`.
+
 ## 2026-07-26 — Config validation: SL/TP independence + netting duplicate-symbol guard
 
 ### Removed

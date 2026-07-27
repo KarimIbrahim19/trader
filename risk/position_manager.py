@@ -147,6 +147,12 @@ class PositionManager:
 
         self._flush_pending()
 
+    def on_price(self, price: float, ts: int) -> None:
+        """Sub-bar price check called from on_mark_price().  Checks SL/TP
+        for all open trades using current mark price.  No new entries."""
+        self._manage_open_trades(price, price, price, 0.0, ts, False, False)
+        self._flush_pending()
+
     # ── Flip detection ────────────────────────────────────────────────────
     def _is_flip_scenario(self, long_signal: bool, short_signal: bool) -> bool:
         if not self.ledger.open_trades:
