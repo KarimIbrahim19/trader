@@ -1,5 +1,59 @@
 # Changelog
 
+## 2026-07-26 — Config validation: SL/TP independence + netting duplicate-symbol guard
+
+### Removed
+- Removed `tp1_atr > sl_atr` validation (`core/config.py`). `sl_atr` and
+  `tp1_atr` are now independent — SL can be wider, tighter, or equal to TP1 as
+  the strategy requires.
+
+### Added
+- `_validate()` in `core/config.py`: duplicate (venue, symbol) check for
+  netting mode. If 2+ enabled strategies share the same symbol on the same
+  venue and that venue is in `netting` mode, startup is rejected with a clear
+  error. Hedge mode allows any number of strategies per symbol.
+
+## 2026-07-11 — Hedge mode support (netting stays default) + NT v1.230.0
+
+### Added (hedge mode)
+- `venues.<name>.position_mode: netting | hedge` in `settings.yaml` (default
+  `netting`). Account-wide Binance setting (`POST /fapi/v1/positionSide/dual`
+  per venue), not per symbol or strategy.
+- `core/exchanges/binance.py`: `verify_position_mode()` — read-only
+  `GET /fapi/v1/positionSide/dual` startup check. Refuses to start if config
+  mismatches exchange. `build_exec_client_cfg()` derives `use_reduce_only` from
+  `position_mode` (`False` for hedge — Binance rejects `reduceOnly` combined
+  with `positionSide`).
+- `core/exchanges/base.py`: `verify_position_mode()` interface method.
+- `main.py`: startup check verifies each venue's actual mode matches config
+  before strategy/node construction.
+- `scripts/check_infra.py`: "6. Position mode" diagnostic section (renumbered
+  existing sections 7–11).
+- `risk/position_manager.py`: `PositionManagerConfig.position_mode`. Under
+  hedge, `on_bar()` never calls `_is_flip_scenario()`/`_execute_netted_flip()`
+  — LONG and SHORT are independent exchange slots. Pending-order buffer keyed
+  by per-side bucket ("LONG"/"SHORT"). `SubmitOrderFn` gains `position_side`
+  parameter. `reduce_only` never sent in hedge mode.
+- `strategies/base_smc_strategy.py`: `BaseSmcConfig.position_mode` resolved
+  from venue at build time. `_make_submit_fn()` tags every order with
+  `position_id` ending `-LONG`/`-SHORT` in hedge mode. `_make_position_fn()`
+  returns `{"LONG": qty, "SHORT": qty}` dict for hedge reconciler.
+- `risk/reconciler.py`: `check()` detects `portfolio_fn()` return shape (float
+  vs dict) and branches. Hedge groups compare LONG and SHORT independently
+  (no sum-based blind spot). `is_halted()` takes optional `side` — a Case B
+  halt on one side only blocks that side's new entries.
+- `docs/hedge_mode_implementation.md`, `docs/position_mode_netting_vs_hedge.md`.
+
+### Changed
+- `nautilus_trader>=1.228.0` → `>=1.230.0` (`requirements.txt`) — picks up
+  upstream hedge position ID fix (PR #4327) and leverage init fix (PR #4289).
+
+### Removed
+- **Monkey-patch** `BinanceFuturesExecutionClient._update_account_state`
+  (lines 56–85 of `core/exchanges/binance.py`) — dead code since NT
+  v1.229.0 fixed the leverage init crash upstream (PR #4289). v1.230.0
+  confirmed running clean for 2+ days before removal.
+
 ## 2026-07-06 — Multi-exchange / multi-symbol refactor
 
 ### Added

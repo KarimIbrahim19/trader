@@ -94,11 +94,13 @@ def build_node(settings: Settings) -> TradingNode:
             venue_symbols = symbols_by_venue.get(venue_key, {})
             exec_clients[nt_venue] = adapter.build_exec_client_cfg(
                 creds, settings.is_paper, venue_symbols,
+                position_mode=settings.position_mode_for(venue_key),
             )
             exec_factories.append((nt_venue, adapter.exec_client_factory()))
             logger.info(
-                "Exec client configured  venue=%s  mode=%s  symbols=%s",
+                "Exec client configured  venue=%s  mode=%s  symbols=%s  position_mode=%s",
                 nt_venue, settings.mode, list(venue_symbols),
+                settings.position_mode_for(venue_key),
             )
         else:
             logger.info("Exec client disabled  venue=%s  (dry_run)", nt_venue)

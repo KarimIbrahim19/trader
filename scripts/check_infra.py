@@ -173,9 +173,31 @@ def check_exchange_api_keys(settings) -> bool:
     return all_ok
 
 
-# ── 6. Telegram ───────────────────────────────────────────────────────────
+# ── 6. Position mode (netting/hedge) ───────────────────────────────────────
+def check_position_mode(settings) -> bool:
+    _section("6. Position mode (netting/hedge)")
+    if settings.is_dry_run:
+        _warn("mode=dry_run — skipping position mode check (no account to check)")
+        return True
+
+    from core.exchanges import get_adapter
+    all_ok = True
+    for venue in settings.venues:
+        adapter  = get_adapter(venue)
+        creds    = settings.credentials_for(venue)
+        expected = settings.position_mode_for(venue)
+        result   = adapter.verify_position_mode(creds, settings.is_paper, expected)
+        if result["ok"]:
+            _ok(f"[{venue}] {result['detail']}")
+        else:
+            _fail(f"[{venue}] {result['detail']}")
+            all_ok = False
+    return all_ok
+
+
+# ── 7. Telegram ───────────────────────────────────────────────────────────
 def check_telegram(settings) -> bool:
-    _section("6. Telegram bot")
+    _section("7. Telegram bot")
     if not settings.telegram.enabled:
         _warn("telegram.enabled=false — skipping check")
         return True
@@ -213,9 +235,9 @@ def check_telegram(settings) -> bool:
         return False
 
 
-# ── 7. Signal modules ─────────────────────────────────────────────────────
+# ── 8. Signal modules ─────────────────────────────────────────────────────
 def check_signal_modules() -> bool:
-    _section("7. Signal modules (core/)")
+    _section("8. Signal modules (core/)")
     modules = [
         ("core.market_structure", "MarketStructure"),
         ("core.htf_bias",         "HTFBias"),
@@ -238,9 +260,9 @@ def check_signal_modules() -> bool:
     return all_ok
 
 
-# ── 8. Strategy modules ───────────────────────────────────────────────────
+# ── 9. Strategy modules ───────────────────────────────────────────────────
 def check_strategy_modules() -> bool:
-    _section("8. Strategy modules")
+    _section("9. Strategy modules")
     modules = [
         ("risk.trade_ledger",         "TradeLedger"),
         ("risk.position_manager",     "PositionManager"),
@@ -265,9 +287,9 @@ def check_strategy_modules() -> bool:
     return all_ok
 
 
-# ── 9. NautilusTrader ────────────────────────────────────────────────────
+# ── 10. NautilusTrader ───────────────────────────────────────────────────
 def check_nautilus() -> bool:
-    _section("9. NautilusTrader")
+    _section("10. NautilusTrader")
     try:
         import nautilus_trader
         _ok(f"nautilus_trader version: {nautilus_trader.__version__}")
@@ -281,7 +303,7 @@ def check_nautilus() -> bool:
 
 # ── State files ───────────────────────────────────────────────────────────
 def check_state_files() -> bool:
-    _section("10. Persistence state files")
+    _section("11. Persistence state files")
     state_dir = Path("state")
     if not state_dir.exists():
         _ok("state/ directory does not exist yet — will be created on first run")
@@ -325,6 +347,7 @@ def main() -> None:
     redis_ok    = check_redis(settings)
     network_ok  = check_exchange_connectivity(settings)
     api_ok      = check_exchange_api_keys(settings)
+    posmode_ok  = check_position_mode(settings)
     tg_ok       = check_telegram(settings)
     modules_ok  = check_signal_modules()
     strategy_ok = check_strategy_modules()
@@ -337,6 +360,7 @@ def main() -> None:
         "Redis":            redis_ok,
         "Network":          network_ok,
         "Exchange API":     api_ok,
+        "Position mode":    posmode_ok,
         "Telegram":         tg_ok,
         "Signal modules":   modules_ok,
         "Strategy modules":  strategy_ok,

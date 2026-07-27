@@ -33,6 +33,7 @@ class ExchangeAdapter(Protocol):
         creds: Tuple[str, str],
         is_paper: bool,
         symbol_settings: dict,
+        position_mode: str = "netting",
     ) -> Any:
         """
         Return the NT ExecClientConfig for this venue.
@@ -41,6 +42,24 @@ class ExchangeAdapter(Protocol):
         every symbol traded on this venue, so leverage/margin type can
         be applied per symbol in one client (multiple strategies on the
         same symbol already share this).
+
+        `position_mode` is "netting" (default) or "hedge" -- an
+        account-wide setting on Binance, not per-symbol. Adapters that
+        support hedge mode should adjust client config accordingly
+        (e.g. Binance requires reduce-only orders to be disabled).
+        """
+        ...
+
+    def verify_position_mode(
+        self, creds: Tuple[str, str], is_paper: bool, expected_mode: str,
+    ) -> dict:
+        """
+        Query the exchange's actual account-wide position mode and
+        compare it to `expected_mode` ("netting" or "hedge"). Never
+        changes it automatically -- switching modes on a live account
+        typically requires flattening all positions and canceling all
+        open orders first, so this is a read-only safety check run at
+        startup. Return {"ok": bool, "detail": str}.
         """
         ...
 

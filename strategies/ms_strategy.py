@@ -27,6 +27,7 @@ class MsSettings(StrategySettingsBase):
 
     def build_config(
         self, strategy_id: str, instrument_id: InstrumentId, venue: str,
+        position_mode: str,
         state_dir: str, mode: str,
         primary_bar: BarType, htf_bar: BarType,
     ) -> MsStrategyConfig:
@@ -34,6 +35,7 @@ class MsSettings(StrategySettingsBase):
             strategy_id           = strategy_id,
             instrument_id         = instrument_id,
             venue                 = venue,
+            position_mode         = position_mode,
             bar_type              = primary_bar,
             bar_type_htf          = htf_bar,
             state_dir             = state_dir,

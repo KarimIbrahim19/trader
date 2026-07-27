@@ -62,7 +62,7 @@ class StrategySettingsBase:
     warmup_bars:           int
     htf_warmup_bars:       int
 
-    def build_config(self, strategy_id, instrument_id, venue, state_dir, mode, primary_bar, htf_bar):
+    def build_config(self, strategy_id, instrument_id, venue, position_mode, state_dir, mode, primary_bar, htf_bar):
         raise NotImplementedError(
             f"{self.__class__.__name__} must implement build_config(). "
             "See MsSettings or FvgSettings for the pattern."
@@ -96,8 +96,20 @@ class VenueSettings:
     """
     Connection-level settings for one exchange venue.
     Keyed by venue name (lowercase) under the `venues:` YAML block.
+
+    position_mode: "netting" (default) or "hedge". Binance's position
+    mode is account-wide (applies to every symbol on that account, per
+    POST /fapi/v1/positionSide/dual) -- so this lives here, per venue,
+    not per symbol or per strategy. Switching an existing live venue
+    from netting to hedge (or back) requires flattening ALL positions
+    and canceling ALL open orders on that account first -- Binance
+    rejects the mode-change call otherwise. This system never switches
+    it automatically; it only verifies the account's actual mode
+    matches this setting at startup and refuses to start if not (see
+    core/exchanges/binance.py's verify_position_mode()).
     """
-    account_type: str
+    account_type:  str
+    position_mode: str = "netting"
 
 
 @dataclass
@@ -223,6 +235,11 @@ class Settings:
             return "", ""
         return creds.active(self.is_paper)
 
+    def position_mode_for(self, venue: str) -> str:
+        """Return "netting" or "hedge" for the given venue."""
+        v = self.venues.get(venue.lower())
+        return v.position_mode if v is not None else "netting"
+
     @property
     def enabled_strategies(self) -> Dict[str, StrategySettingsBase]:
         return {k: v for k, v in self.strategies.items() if v.enabled}
@@ -254,7 +271,10 @@ def load_settings(config_dir=None, settings_file="settings.yaml") -> Settings:
     venue_credentials: Dict[str, VenueCredentials] = {}
     for vname, v in venues_raw.items():
         vkey = vname.lower()
-        venues[vkey] = VenueSettings(account_type=v["account_type"])
+        venues[vkey] = VenueSettings(
+            account_type  = v["account_type"],
+            position_mode = v.get("position_mode", "netting"),
+        )
         env_prefix = vname.upper()
         venue_credentials[vkey] = VenueCredentials(
             api_key            = os.getenv(f"{env_prefix}_API_KEY", ""),
@@ -372,6 +392,13 @@ def _validate(s: Settings) -> None:
     if not s.strategies:
         errors.append("No strategies defined in settings.yaml")
 
+    for vkey, v in s.venues.items():
+        if v.position_mode not in {"netting", "hedge"}:
+            errors.append(
+                f"venues.{vkey}: position_mode must be 'netting' or 'hedge' "
+                f"(got '{v.position_mode}')"
+            )
+
     if s.telegram.enabled:
         if not s.telegram.bot_token:
             errors.append("telegram.enabled=true requires TELEGRAM_BOT_TOKEN in config/.env")
@@ -413,8 +440,6 @@ def _validate(s: Settings) -> None:
                     "in config/.env"
                 )
 
-        if st.tp1_atr <= st.sl_atr:
-            errors.append(f"{prefix}: tp1_atr ({st.tp1_atr}) must be > sl_atr ({st.sl_atr})")
         if st.trade_size <= 0:
             errors.append(f"{prefix}: trade_size must be > 0")
         if st.max_open_trades < 1:
@@ -425,6 +450,25 @@ def _validate(s: Settings) -> None:
             errors.append(f"{prefix}: trail_atr_mult must be > 0 when trailing_tp2=true")
         if st.min_free_margin_usdt < 0:
             errors.append(f"{prefix}: min_free_margin_usdt must be >= 0 (use 0.0 to disable)")
+
+    venue_symbol_strats: dict[tuple[str, str], list[str]] = {}
+    for name, st in s.strategies.items():
+        if not st.enabled:
+            continue
+        key = (st.venue.lower(), st.symbol.upper())
+        venue_symbol_strats.setdefault(key, []).append(name)
+
+    for (venue, symbol), strat_names in venue_symbol_strats.items():
+        if len(strat_names) < 2:
+            continue
+        v = s.venues.get(venue)
+        if v is not None and v.position_mode == "netting":
+            errors.append(
+                f"venues.{venue}: position_mode='netting' but "
+                f"multiple strategies share symbol '{symbol}': "
+                f"{', '.join(strat_names)}. "
+                f"Set position_mode='hedge' or keep one strategy per symbol."
+            )
 
     for (vkey, sym), sym_cfg in s.symbols.items():
         sprefix = f"symbols.{vkey}:{sym}"

@@ -2,9 +2,8 @@
 core/exchanges/binance.py
 ────────────────────────────────────────────────────────────────────────
 Binance USDT-M Futures adapter. All Binance-specific NT wiring lives
-here: client config construction, testnet URL routing, the v1.228
-leverage-init monkey-patch (see docs/binance_leverage_init_bug.md), and
-the HTTP calls used for exchange-filter lookups and API-key validation
+here: client config construction, testnet URL routing, and the HTTP
+calls used for exchange-filter lookups and API-key validation
 (previously duplicated between strategies/base_smc_strategy.py and
 scripts/check_infra.py).
 
@@ -53,38 +52,6 @@ _TESTNET_WS_API     = "wss://testnet.binancefuture.com/ws-fapi/v1"
 _LIVE_REST = "https://fapi.binance.com"
 
 
-# ── Monkey-patch: Binance Futures leverage init crash (NT v1.228) ──────
-#
-# BinanceFuturesExecClient._update_account_state() calls
-# query_futures_symbol_config() with no symbol filter, then iterates ALL
-# returned symbols calling account.set_leverage(). If any symbol has
-# leverage=0 (common on testnet for unused symbols), set_leverage() raises
-# ValueError("leverage was not >= 1"). The except KeyError handler is
-# dead code (_get_cached_instrument_id() never raises), so the
-# ValueError propagates and kills _connect().
-#
-# Fixed upstream in NT v1.229.0 (PR #4289). Remove this block after
-# upgrading (see docs/binance_leverage_init_bug.md and PROJECT_v2.md §9).
-import nautilus_trader.adapters.binance.futures.execution as _futures_exec
-
-_orig_update_account_state = _futures_exec.BinanceFuturesExecutionClient._update_account_state
-
-
-async def _patched_update_account_state(self):
-    try:
-        await _orig_update_account_state(self)
-    except ValueError as e:
-        if "leverage was not >= 1" in str(e):
-            logger.warning(
-                "Ignored invalid leverage during connect (testnet symbol config quirk): %s", e,
-            )
-        else:
-            raise
-
-
-_futures_exec.BinanceFuturesExecutionClient._update_account_state = _patched_update_account_state
-
-
 class BinanceAdapter:
     """USDT-M Futures adapter. See core/exchanges/base.py for the interface."""
 
@@ -102,7 +69,10 @@ class BinanceAdapter:
             instrument_provider = InstrumentProviderConfig(load_all=True),
         )
 
-    def build_exec_client_cfg(self, creds: Tuple[str, str], is_paper: bool, symbol_settings: dict):
+    def build_exec_client_cfg(
+        self, creds: Tuple[str, str], is_paper: bool, symbol_settings: dict,
+        position_mode: str = "netting",
+    ):
         api_key, api_secret = creds
 
         leverages: dict = {}
@@ -112,6 +82,12 @@ class BinanceAdapter:
             leverages[bsym] = sym_cfg.leverage
             if sym_cfg.margin_type is not None:
                 margin_types[bsym] = BinanceFuturesMarginType(sym_cfg.margin_type)
+
+        # Binance rejects reduceOnly combined with positionSide in Hedge
+        # Mode -- NT's adapter actually asserts this at connect time
+        # (BinanceFuturesExecutionClient._init_dual_side_position), so
+        # this must be False whenever the venue is configured for hedge.
+        use_reduce_only = position_mode != "hedge"
 
         return BinanceExecClientConfig(
             api_key             = api_key,
@@ -123,6 +99,7 @@ class BinanceAdapter:
             instrument_provider = InstrumentProviderConfig(load_all=True),
             futures_leverages    = leverages,
             futures_margin_types = margin_types or None,
+            use_reduce_only      = use_reduce_only,
         )
 
     def data_client_factory(self) -> type:
@@ -156,6 +133,49 @@ class BinanceAdapter:
             ("fapi.binance.com",    443, "Futures REST API"),
             ("fstream.binance.com", 443, "Futures WebSocket"),
         ]
+
+    def verify_position_mode(
+        self, creds: Tuple[str, str], is_paper: bool, expected_mode: str,
+    ) -> dict:
+        """
+        GET /fapi/v1/positionSide/dual â€” read-only, account-wide check.
+        Never calls POST /fapi/v1/positionSide/dual to change it: Binance
+        rejects that call outright if the account has any open position
+        or open order, so switching modes has to be a deliberate manual
+        step (flatten everything, switch, restart), not something this
+        system does automatically at startup.
+        """
+        key, secret = creds
+        if not key or not secret:
+            return {"ok": False, "detail": "API key/secret not set â€” cannot verify position mode"}
+
+        base = _TESTNET_HTTP if is_paper else _LIVE_REST
+        ts     = int(time.time() * 1000)
+        params = f"timestamp={ts}"
+        signature = hmac.new(secret.encode(), params.encode(), hashlib.sha256).hexdigest()
+        url = f"{base}/fapi/v1/positionSide/dual?{params}&signature={signature}"
+        req = urllib.request.Request(url, headers={"X-MBX-APIKEY": key})
+        try:
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                data = json.loads(resp.read())
+            is_hedge = bool(data.get("dualSidePosition"))
+            actual_mode = "hedge" if is_hedge else "netting"
+            if actual_mode == expected_mode:
+                return {"ok": True, "detail": f"Account position mode is '{actual_mode}', matches config"}
+            return {
+                "ok": False,
+                "detail": (
+                    f"Account position mode is '{actual_mode}' but settings.yaml expects "
+                    f"'{expected_mode}'. Binance only lets you change this when the account "
+                    "has NO open positions and NO open orders â€” flatten everything first, "
+                    "then call POST /fapi/v1/positionSide/dual (or use Binance's UI) manually, "
+                    "then restart."
+                ),
+            }
+        except urllib.error.HTTPError as e:
+            return {"ok": False, "detail": f"Position mode check failed: HTTP {e.code}: {e.reason}"}
+        except Exception as e:
+            return {"ok": False, "detail": f"Position mode check failed: {e}"}
 
     def validate_api_key(self, creds: Tuple[str, str], is_paper: bool) -> dict:
         key, secret = creds

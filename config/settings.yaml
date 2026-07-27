@@ -12,7 +12,7 @@ mode: paper
 
 # ── Instance identity ────────────────────────────────────────────────
 # Must be unique per running instance to prevent Redis key collisions.
-trader_id: LIVETRADER-001
+trader_id: TESTTRADER-001
 
 # ── Venues ────────────────────────────────────────────────────────────
 # Connection-level settings, one entry per exchange. Credentials are
@@ -23,7 +23,8 @@ trader_id: LIVETRADER-001
 # only "binance" is implemented).
 venues:
   binance:
-    account_type: USDT_FUTURES
+    account_type:    USDT_FUTURES
+    position_mode:   hedge
 
 # ── Symbols ───────────────────────────────────────────────────────────
 # Exchange-account-level settings, one entry per "venue:SYMBOL" pair.
@@ -121,7 +122,7 @@ strategies:
     htf_bar:                  1h
     htf_period:               21
     trade_size:               0.01
-    sl_atr:                   1.5
+    sl_atr:                   2.5
     tp1_atr:                  2.0
     tp2_atr:                  3.5
     trailing_tp2:             false
@@ -169,8 +170,8 @@ logging:
   level_file:      DEBUG
   log_dir:         logs
   log_file_name:   live_trader.log
-  rotate_mb:       5
-  keep_backups:    10
+  rotate_mb:       50
+  keep_backups:    5
 
 # ── Telegram ──────────────────────────────────────────────────────────
 telegram:

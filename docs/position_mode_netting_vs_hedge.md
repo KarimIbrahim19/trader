@@ -1,5 +1,11 @@
 # Position Mode: NETTING vs HEDGE
 
+> **Superseded.** This document was written when the system ran in NETTING
+> mode and recommended staying on it. Hedge mode has since been enabled
+> (see `docs/hedge_mode_implementation.md`). The NETTING-vs-HEDGE
+> comparison below is still accurate as reference, but the "Recommendation:
+> Stay on NETTING" conclusion no longer applies to the live system.
+
 ## Current Setup: NETTING (One-Way)
 
 Binance USDT-M Futures **default** mode. One position per symbol, expressed as a signed

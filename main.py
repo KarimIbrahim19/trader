@@ -80,6 +80,7 @@ def _build_strategy(
         strategy_id   = strat_settings.strategy_id,
         instrument_id = instrument_id,
         venue         = strat_settings.venue,
+        position_mode = settings.position_mode_for(strat_settings.venue),
         state_dir     = "state",
         mode          = settings.mode,
         primary_bar   = primary_bar,
@@ -113,6 +114,8 @@ def main() -> None:
     logger.info("  Trader ID  : %s", settings.trader_id)
     logger.info("  Mode       : %s", settings.mode)
     logger.info("  Venues     : %s", ", ".join(settings.venues) or "(none)")
+    for vkey, v in settings.venues.items():
+        logger.info("    - %-10s account_type=%s  position_mode=%s", vkey, v.account_type, v.position_mode)
     enabled = settings.enabled_strategies
     if enabled:
         for name, s in enabled.items():
@@ -148,6 +151,25 @@ def main() -> None:
         sys.exit(result.returncode)
 
     _check_redis(settings)
+
+    # ── Position mode safety check ─────────────────────────────────────────
+    # Binance's position mode (netting/hedge) is account-wide and can only
+    # be changed when the account has zero open positions/orders — this
+    # system never switches it automatically. Refuse to start rather than
+    # trade against a mismatched assumption (see core/exchanges/binance.py's
+    # verify_position_mode()).
+    if not settings.is_dry_run:
+        from core.exchanges import get_adapter
+        for venue_key in settings.venues:
+            adapter = get_adapter(venue_key)
+            creds   = settings.credentials_for(venue_key)
+            expected = settings.position_mode_for(venue_key)
+            result = adapter.verify_position_mode(creds, settings.is_paper, expected)
+            if result["ok"]:
+                logger.info("Position mode  venue=%s  %s", venue_key, result["detail"])
+            else:
+                logger.error("Position mode  venue=%s  %s", venue_key, result["detail"])
+                sys.exit(1)
 
     # ── Telegram notifier ─────────────────────────────────────────────────
     from actors.telegram_actor import TelegramNotifier

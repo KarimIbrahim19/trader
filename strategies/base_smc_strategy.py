@@ -38,7 +38,7 @@ from nautilus_trader.config import StrategyConfig
 from nautilus_trader.core.data import Data
 from nautilus_trader.model.data import Bar, BarAggregation, BarType
 from nautilus_trader.model.enums import OrderSide, TimeInForce
-from nautilus_trader.model.identifiers import InstrumentId, Venue
+from nautilus_trader.model.identifiers import InstrumentId, PositionId, Venue
 from nautilus_trader.trading.strategy import Strategy
 
 from core.exchanges import get_adapter
@@ -57,7 +57,7 @@ _BAR_STEP_SECONDS = {
 
 
 # ── Base config ───────────────────────────────────────────────────────────
-class BaseSmcConfig(StrategyConfig, frozen=True):
+class BaseSmcConfig(StrategyConfig, frozen=True, kw_only=True):
     instrument_id:         InstrumentId
     venue:                 str    # e.g. "binance" -- key into core.exchanges.get_adapter()
     bar_type:              BarType
@@ -80,6 +80,7 @@ class BaseSmcConfig(StrategyConfig, frozen=True):
     min_free_margin_usdt:  float
     warmup_bars:           int
     htf_warmup_bars:       int
+    position_mode:         str = "netting"  # "netting" | "hedge" -- resolved from venue at build time
 
 
 # ── Base strategy ─────────────────────────────────────────────────────────
@@ -327,6 +328,7 @@ class BaseSmcStrategy(Strategy):
             min_free_margin_usdt  = cfg.min_free_margin_usdt,
             min_qty               = min_qty,
             min_notional          = min_notional,
+            position_mode         = cfg.position_mode,
         )
         self.pm = PositionManager(
             config             = pm_cfg,
@@ -455,9 +457,17 @@ class BaseSmcStrategy(Strategy):
         # ── Stage 6: suppress new entries if this group is halted (Case B)
         # Only halts entries for this strategy's own (venue, instrument)
         # group -- a halt on one symbol/venue doesn't affect others.
-        if self._reconciler is not None and self._reconciler.is_halted(cfg.venue, cfg.instrument_id):
-            long_signal  = False
-            short_signal = False
+        # Hedge mode: LONG and SHORT are independent exchange slots, so a
+        # halt on one side only suppresses that side's new entries.
+        if self._reconciler is not None:
+            if cfg.position_mode == "hedge":
+                if self._reconciler.is_halted(cfg.venue, cfg.instrument_id, side="LONG"):
+                    long_signal = False
+                if self._reconciler.is_halted(cfg.venue, cfg.instrument_id, side="SHORT"):
+                    short_signal = False
+            elif self._reconciler.is_halted(cfg.venue, cfg.instrument_id):
+                long_signal  = False
+                short_signal = False
 
         # Notify signal before pm.on_bar() so signal message arrives first
         if self._notifier is not None:
@@ -614,10 +624,16 @@ class BaseSmcStrategy(Strategy):
 
     # ── Stage 5 + 6: closures ─────────────────────────────────────────────
     def _make_submit_fn(self):
-        def _submit(side: str, qty: Decimal, reduce_only: bool = False) -> Optional[str]:
+        hedge = self.config.position_mode == "hedge"
+
+        def _submit(
+            side: str, qty: Decimal, reduce_only: bool = False,
+            position_side: Optional[str] = None,
+        ) -> Optional[str]:
             if self.config.mode == "dry_run":
+                tag = f"  positionSide={position_side}" if hedge else ""
                 self.log.info(
-                    f"DRY_RUN {side:<4}  {float(qty):.6f} {self._symbol}  "
+                    f"DRY_RUN {side:<4}  {float(qty):.6f} {self._symbol}{tag}  "
                     f"[{str(self.config.strategy_id)}]"
                 )
                 return None
@@ -627,9 +643,22 @@ class BaseSmcStrategy(Strategy):
                 order_side    = order_side,
                 quantity      = self.instrument.make_qty(qty),
                 time_in_force = TimeInForce.GTC,
-                reduce_only   = reduce_only,
+                # Binance rejects reduceOnly combined with positionSide in
+                # hedge mode -- BUY/SELL against a trade's own LONG/SHORT
+                # slot is already unambiguous, so reduce_only is never sent.
+                reduce_only   = False if hedge else reduce_only,
             )
-            self.submit_order(order)
+            position_id = None
+            if hedge:
+                if position_side not in ("LONG", "SHORT"):
+                    self.log.error(
+                        f"Hedge mode order missing a valid position_side "
+                        f"(got {position_side!r}) — defaulting to LONG. "
+                        "This indicates a bug in the calling code."
+                    )
+                    position_side = "LONG"
+                position_id = PositionId(f"{self.config.instrument_id}-{position_side}")
+            self.submit_order(order, position_id=position_id)
             return str(order.client_order_id)
         return _submit
 
@@ -668,11 +697,35 @@ class BaseSmcStrategy(Strategy):
 
     def _make_position_fn(self):
         """
-        Stage 6: Returns the signed net position (in this strategy's own
-        instrument) from NT's portfolio.
-        Positive = net long, negative = net short, 0.0 = flat.
-        Returns None when the portfolio isn't ready (skip check).
+        Stage 6: Returns this strategy's own instrument exposure from NT's
+        portfolio/cache.
+
+        Netting: a single signed float (positive=long, negative=short,
+        0.0=flat), read from NT's blended portfolio position.
+
+        Hedge: a dict {"LONG": qty>=0, "SHORT": qty>=0} -- LONG and SHORT
+        are independent exchange slots under hedge mode, so there is no
+        single signed number to compare; the reconciler compares each
+        side against its own ledger exposure separately (see
+        risk/reconciler.py).
+
+        Returns None when the portfolio/cache isn't ready (skip check).
         """
+        if self.config.position_mode == "hedge":
+            long_id  = PositionId(f"{self.config.instrument_id}-LONG")
+            short_id = PositionId(f"{self.config.instrument_id}-SHORT")
+
+            def _get_hedge() -> Optional[dict]:
+                try:
+                    long_pos  = self.cache.position(long_id)
+                    short_pos = self.cache.position(short_id)
+                    long_qty  = abs(float(long_pos.signed_qty))  if long_pos  is not None else 0.0
+                    short_qty = abs(float(short_pos.signed_qty)) if short_pos is not None else 0.0
+                    return {"LONG": long_qty, "SHORT": short_qty}
+                except Exception:
+                    return None   # not ready yet — reconciler will skip
+            return _get_hedge
+
         def _get_net() -> Optional[float]:
             try:
                 pos = self.portfolio.net_position(self.config.instrument_id)

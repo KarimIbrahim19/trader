@@ -1,6 +1,27 @@
 """
 risk/position_manager.py
 ────────────────────────────────────────────────────────────────────────
+Hedge mode support:
+  • PositionManagerConfig.position_mode: "netting" (default) or "hedge".
+  • Netting (unchanged): one blended exchange position per instrument.
+    A new opposite-direction signal while a trade is open triggers
+    _execute_netted_flip() (close opposing + open new, one consolidated
+    order). Pending orders are buffered in a single bucket per bar.
+  • Hedge: LONG and SHORT are independent exchange slots (Binance
+    positionSide=LONG/SHORT), so a strategy can hold both directions at
+    once with no conflict. _is_flip_scenario()/_execute_netted_flip()
+    are never invoked in hedge mode -- on_bar() just opens/manages each
+    side independently. Pending orders are buffered in a SEPARATE
+    bucket per position_side ("LONG"/"SHORT"), each flushed as its own
+    order tagged with that side, since a LONG-side close and a
+    SHORT-side open can never be netted into one order (they're
+    different exchange positions). reduce_only is never used in hedge
+    mode -- Binance rejects it combined with positionSide.
+  • SubmitOrderFn gained a 4th parameter, position_side: Optional[str]
+    ("LONG"/"SHORT" in hedge mode, None in netting mode). The strategy
+    layer (BaseSmcStrategy._make_submit_fn) uses it to build NT's
+    position_id for the order; netting mode ignores it entirely.
+
 Stage 5 additions:
   • SubmitOrderFn now returns Optional[str] — the NT client_order_id for
     entry orders, None for dry_run. Close orders ignore the return value.
@@ -26,9 +47,13 @@ from risk.trade_ledger import OpenTrade, TradeLedger
 
 # Entry orders return the NT client_order_id (str) or None in dry_run.
 # Close orders are submitted with the same fn but the return is ignored.
-SubmitOrderFn       = Callable[[str, Decimal, bool], Optional[str]]
+# position_side: "LONG"/"SHORT" in hedge mode, None in netting mode.
+SubmitOrderFn       = Callable[[str, Decimal, bool, Optional[str]], Optional[str]]
 OnOrderSubmittedFn  = Optional[Callable[[list[int], str], None]]
 BalanceCheckFn      = Optional[Callable[[], float]]
+
+# Pending-buffer bucket key for netting mode (single blended position).
+_NETTING_BUCKET = "BOTH"
 
 
 @dataclass
@@ -47,6 +72,7 @@ class PositionManagerConfig:
     min_free_margin_usdt:  float   # Stage 5: 0.0 = disabled
     min_qty:               Decimal = Decimal("0.001")    # LOT_SIZE / MARKET_LOT_SIZE
     min_notional:          float = 50.0                  # MIN_NOTIONAL (USDT)
+    position_mode:         str = "netting"                # "netting" | "hedge"
 
 
 class PositionManager:
@@ -78,15 +104,15 @@ class PositionManager:
         self._kill_switch_notified: bool = False
         self._state_dirty:          bool = False
 
-        # Pending order buffer — deferred submission for consolidation
-        # Granular counters separated by close vs entry so _flush_pending()
-        # can split when the consolidated net would fall below MIN_NOTIONAL.
-        self._pending_buy_close:  Decimal   = Decimal("0")
-        self._pending_buy_entry:  Decimal   = Decimal("0")
-        self._pending_sell_close: Decimal   = Decimal("0")
-        self._pending_sell_entry: Decimal   = Decimal("0")
-        self._pending_ids_close:  list[int] = []
-        self._pending_ids_entry:  list[int] = []
+        # Pending order buffer — deferred submission for consolidation.
+        # Keyed by bucket: "BOTH" for netting mode (single blended
+        # position, current behavior unchanged), or "LONG"/"SHORT" for
+        # hedge mode (independent exchange slots — never netted against
+        # each other). Each bucket separates close vs entry qty so
+        # _flush_pending() can split when the consolidated net would
+        # fall below MIN_NOTIONAL, same as before.
+        self._pending: dict[str, dict] = {}
+        self._reset_pending()
 
     # ── Main update ───────────────────────────────────────────────────────
     def on_bar(
@@ -99,7 +125,19 @@ class PositionManager:
 
         self._manage_open_trades(high, low, close, atr, ts, long_signal, short_signal)
 
-        if self._is_flip_scenario(long_signal, short_signal):
+        if self.config.position_mode == "hedge":
+            # LONG and SHORT are independent exchange slots under hedge
+            # mode -- a strategy can hold both at once with no conflict,
+            # so there is no "flip" scenario to detect or execute. Any
+            # opposing trade left open by _manage_open_trades (e.g.
+            # because enable_exit_signal=False) just keeps running
+            # toward its own SL/TP; a new opposite-direction signal
+            # opens its own independent trade rather than closing it.
+            if long_signal and self._can_enter(close):
+                self._enter("LONG", close, atr, ts)
+            if short_signal and self._can_enter(close):
+                self._enter("SHORT", close, atr, ts)
+        elif self._is_flip_scenario(long_signal, short_signal):
             self._execute_netted_flip(high, low, close, atr, ts, long_signal, short_signal)
         else:
             if long_signal and self._can_enter(close):
@@ -244,11 +282,12 @@ class PositionManager:
         # Enqueue close and entry separately so the MIN_NOTIONAL split
         # logic in _flush_pending can distinguish them, avoiding the bug
         # where close (BUY) and entry (SELL) cancel into a sub-threshold net.
+        # Netting mode only -- always the single "BOTH" bucket.
         opposing_ids = [t.trade_id for t in opposing_trades]
         if sum_opposing > 0:
-            self._enqueue(net_side, sum_opposing, opposing_ids, "close")
+            self._enqueue(net_side, sum_opposing, opposing_ids, "close", _NETTING_BUCKET)
         if new_qty > 0 and new_trade is not None:
-            self._enqueue(net_side, new_qty, [new_trade.trade_id], "entry")
+            self._enqueue(net_side, new_qty, [new_trade.trade_id], "entry", _NETTING_BUCKET)
 
         # Summary log line
         new_part = f"  + open {new_qty}" if can_open_new else ""
@@ -299,7 +338,8 @@ class PositionManager:
             sl=sl, tp1=tp1, tp2=tp2,
         )
         self.ledger.record_open(trade)
-        self._enqueue(order_side, self.config.trade_size, [trade.trade_id], "entry")
+        bucket = side if self.config.position_mode == "hedge" else _NETTING_BUCKET
+        self._enqueue(order_side, self.config.trade_size, [trade.trade_id], "entry", bucket)
         self.log.info(
             f"OPEN  #{trade.trade_id:05d} {side:<5}  entry≈{close:.1f}  "
             f"sl={sl:.1f}  tp1={tp1:.1f}  tp2={tp2:.1f}  "
@@ -309,40 +349,64 @@ class PositionManager:
 
     # ── Pending buffer ─────────────────────────────────────────────────────
     def _reset_pending(self) -> None:
-        self._pending_buy_close  = Decimal("0")
-        self._pending_buy_entry  = Decimal("0")
-        self._pending_sell_close = Decimal("0")
-        self._pending_sell_entry = Decimal("0")
-        self._pending_ids_close  = []
-        self._pending_ids_entry  = []
+        self._pending = {}
 
-    def _enqueue(self, side: str, qty: Decimal, trade_ids: list[int], op_type: str) -> None:
+    def _new_bucket(self) -> dict:
+        return {
+            "buy_close":  Decimal("0"),
+            "buy_entry":  Decimal("0"),
+            "sell_close": Decimal("0"),
+            "sell_entry": Decimal("0"),
+            "ids_close":  [],
+            "ids_entry":  [],
+        }
+
+    def _enqueue(
+        self, side: str, qty: Decimal, trade_ids: list[int], op_type: str,
+        bucket_key: str = _NETTING_BUCKET,
+    ) -> None:
         if qty <= 0:
             return
+        bucket = self._pending.setdefault(bucket_key, self._new_bucket())
         if op_type == "close":
             if side == "BUY":
-                self._pending_buy_close += qty
+                bucket["buy_close"] += qty
             else:
-                self._pending_sell_close += qty
-            self._pending_ids_close.extend(trade_ids)
+                bucket["sell_close"] += qty
+            bucket["ids_close"].extend(trade_ids)
         else:
             if side == "BUY":
-                self._pending_buy_entry += qty
+                bucket["buy_entry"] += qty
             else:
-                self._pending_sell_entry += qty
-            self._pending_ids_entry.extend(trade_ids)
+                bucket["sell_entry"] += qty
+            bucket["ids_entry"].extend(trade_ids)
 
     def _flush_pending(self) -> None:
-        buy_close  = self._pending_buy_close
-        sell_close = self._pending_sell_close
-        buy_entry  = self._pending_buy_entry
-        sell_entry = self._pending_sell_entry
+        # Each bucket ("BOTH" for netting, "LONG"/"SHORT" for hedge) is
+        # flushed independently — a LONG-side close and a SHORT-side
+        # open are two different exchange positions and can never be
+        # netted into one order, unlike close+entry within the same
+        # bucket, which still nets exactly as before.
+        for bucket_key, bucket in list(self._pending.items()):
+            self._flush_bucket(bucket_key, bucket)
+        self._reset_pending()
+
+    def _flush_bucket(self, bucket_key: str, bucket: dict) -> None:
+        buy_close  = bucket["buy_close"]
+        sell_close = bucket["sell_close"]
+        buy_entry  = bucket["buy_entry"]
+        sell_entry = bucket["sell_entry"]
 
         if buy_close == 0 and sell_close == 0 and buy_entry == 0 and sell_entry == 0:
             return
 
         total_buy  = buy_close + buy_entry
         total_sell = sell_close + sell_entry
+        hedge = self.config.position_mode == "hedge"
+        # position_side passed to the submit fn: None in netting mode
+        # (NT/Binance resolve BOTH automatically), the bucket's own
+        # LONG/SHORT tag in hedge mode.
+        position_side = bucket_key if hedge else None
 
         # Compute net side and qty for the consolidated view
         if total_buy > 0 and total_sell > 0:
@@ -352,14 +416,13 @@ class PositionManager:
         elif total_buy > 0:
             net_side     = "BUY"
             net_qty      = total_buy
-            reduce_only  = (buy_entry == 0)  # only close ops → True
+            reduce_only  = (buy_entry == 0) and not hedge  # only close ops → True (netting only; hedge never uses reduce_only)
         else:
             net_side     = "SELL"
             net_qty      = total_sell
-            reduce_only  = (sell_entry == 0)  # only close ops → True
+            reduce_only  = (sell_entry == 0) and not hedge
 
         if net_qty <= 0:
-            self._reset_pending()
             return
 
         # MIN_NOTIONAL guard: only split when close AND entry coexist AND net is below threshold
@@ -368,17 +431,16 @@ class PositionManager:
         notional  = float(net_qty) * self._last_close
 
         if has_close and has_entry and not reduce_only and notional < self.config.min_notional:
-            self._submit_split()
+            self._submit_split(bucket, position_side)
         else:
-            client_order_id = self._submit(net_side, net_qty, reduce_only)
+            client_order_id = self._submit(net_side, net_qty, reduce_only, position_side)
             self._state_dirty = True
             if self._on_order_submitted is not None and client_order_id is not None:
-                all_ids = self._pending_ids_close + self._pending_ids_entry
+                all_ids = bucket["ids_close"] + bucket["ids_entry"]
                 try:
                     self._on_order_submitted(all_ids, client_order_id)
                 except Exception as e:
                     self.log.warning(f"on_order_submitted callback error: {e}")
-            self._reset_pending()
 
     # ── MIN_NOTIONAL split ──────────────────────────────────────────────────
     def _must_split(self, net_qty: Decimal, reduce_only: bool) -> bool:
@@ -387,16 +449,18 @@ class PositionManager:
             return False
         return float(net_qty) * self._last_close < self.config.min_notional
 
-    def _submit_split(self) -> None:
+    def _submit_split(self, bucket: dict, position_side: Optional[str] = None) -> None:
         """Submit close (reduce_only=True, exempt) and entry portions separately."""
+        hedge = self.config.position_mode == "hedge"
         close_side, close_qty = self._net_side_qty(
-            self._pending_buy_close, self._pending_sell_close,
+            bucket["buy_close"], bucket["sell_close"],
         )
         entry_side, entry_qty = self._net_side_qty(
-            self._pending_buy_entry, self._pending_sell_entry,
+            bucket["buy_entry"], bucket["sell_entry"],
         )
 
-        # Submit close first (reduce_only=True → exempt from MIN_NOTIONAL)
+        # Submit close first (reduce_only=True → exempt from MIN_NOTIONAL;
+        # hedge mode never sends reduce_only, positionSide already scopes it)
         close_coid = None
         if close_qty > 0:
             if close_qty < self.config.min_qty:
@@ -405,7 +469,7 @@ class PositionManager:
                     f"< LOT_SIZE min {self.config.min_qty} "
                     f"— submitting as reduce_only (may bypass LOT_SIZE)"
                 )
-            close_coid = self._submit(close_side, close_qty, reduce_only=True)
+            close_coid = self._submit(close_side, close_qty, not hedge, position_side)
             self._state_dirty = True
 
         # Submit entry second (LOT_SIZE check applies)
@@ -424,23 +488,21 @@ class PositionManager:
                         f"< min ${self.config.min_notional:.2f} — skipping entry"
                     )
                 else:
-                    entry_coid = self._submit(entry_side, entry_qty, reduce_only=False)
+                    entry_coid = self._submit(entry_side, entry_qty, False, position_side)
                     self._state_dirty = True
 
         # Callbacks — each split portion gets its own _order_to_trade entry
         if self._on_order_submitted is not None:
-            if close_coid is not None and self._pending_ids_close:
+            if close_coid is not None and bucket["ids_close"]:
                 try:
-                    self._on_order_submitted(self._pending_ids_close, close_coid)
+                    self._on_order_submitted(bucket["ids_close"], close_coid)
                 except Exception as e:
                     self.log.warning(f"on_order_submitted close callback error: {e}")
-            if entry_coid is not None and self._pending_ids_entry:
+            if entry_coid is not None and bucket["ids_entry"]:
                 try:
-                    self._on_order_submitted(self._pending_ids_entry, entry_coid)
+                    self._on_order_submitted(bucket["ids_entry"], entry_coid)
                 except Exception as e:
                     self.log.warning(f"on_order_submitted entry callback error: {e}")
-
-        self._reset_pending()
 
     @staticmethod
     def _net_side_qty(buy: Decimal, sell: Decimal) -> tuple[str, Decimal]:
@@ -572,7 +634,14 @@ class PositionManager:
 
         trade.realized_pnl += pnl
         trade._pending_close_pnl = pnl
-        self._enqueue(order_side, qty_closed, [trade.trade_id], "close")
+        if self.config.position_mode == "hedge":
+            # Binance rejects reduceOnly combined with positionSide in
+            # hedge mode -- selling/buying against trade.side's own slot
+            # is unambiguous (SELL always reduces the LONG slot, BUY
+            # always reduces the SHORT slot), so reduce_only is moot.
+            self._enqueue(order_side, qty_closed, [trade.trade_id], "close", trade.side)
+        else:
+            self._enqueue(order_side, qty_closed, [trade.trade_id], "close", _NETTING_BUCKET)
         self.log.info(
             f"{reason:<12} #{trade.trade_id:05d} {trade.side:<5}  "
             f"exit≈{exit_price:.1f}  frac={qty_frac:.2f}  "
