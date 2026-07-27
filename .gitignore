@@ -3,8 +3,8 @@ config/.env
 *.env
 
 # NautilusTrader runtime logs
-#logs/
-#*.log
+logs/
+*.log
 
 # Trade state (may contain sensitive position data)
 state/
