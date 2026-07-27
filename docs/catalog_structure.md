@@ -69,11 +69,23 @@
 │   ├── 1h.parquet
 │   └── 4h.parquet
 │
+├── depth20/                                 ← top-20 order book snapshots (live, from systemd collector)
+│   ├── 2026-07-22.parquet
+│   ├── 2026-07-23.parquet
+│   ├── 2026-07-24.parquet
+│   ├── 2026-07-25.parquet
+│   ├── 2026-07-26.parquet
+│   └── 2026-07-27.parquet                   ← (date changes daily)
+│
 ├── aggTrades/                               ← aggregate trades (tick-level, on-demand)
-│   └── 2026-06.parquet                      ← ~58M rows
+│   ├── 2026-04.parquet                      ← ~775 MB
+│   ├── 2026-05.parquet                      ← ~632 MB
+│   └── 2026-06.parquet                      ← ~1 GB
 │
 └── rawTrades/                               ← raw trades (tick-level, on-demand)
-    └── 2026-06.parquet                      ← ~147M rows
+    ├── 2026-04.parquet                      ← ~1.3 GB
+    ├── 2026-05.parquet                      ← ~1.1 GB
+    └── 2026-06.parquet                      ← ~1.7 GB
 ```
 
 ---
@@ -89,6 +101,7 @@
 | Open Interest | ~21 days | API lookback limit |
 | L/S ratios (all types) | ~21 days | API lookback limit |
 | Basis | ~21 days | API lookback limit |
+| Depth20 book snapshots | 2026-07-22 → present | Live only (no historical REST) |
 | AggTrades | On-demand (monthly zips) | On-demand download |
 | Raw Trades | On-demand (monthly zips) | On-demand download |
 
@@ -101,7 +114,8 @@
 | Stream | Provides | Currently used? |
 |--------|----------|-----------------|
 | `<symbol>@kline_<interval>` | OHLCV bars | ✅ Strategy entries |
-| `<symbol>@markPrice` | Mark price, funding rate | ✅ Funding regime (to be integrated) |
+| `<symbol>@markPrice` | Mark price, funding rate | ✅ Strategy mark price ticks |
+| `<symbol>@depth20@100ms` | Top-20 order book snapshots | ✅ Live depth20 collector (`live_collector.py`) |
 | `<symbol>@bookTicker` | Best bid/ask, spread | ❌ Not in strategy |
 
 ### Defined in NT adapter but NOT subscribed (data type exists, handler not wired)
